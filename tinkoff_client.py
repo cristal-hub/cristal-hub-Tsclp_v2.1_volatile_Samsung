@@ -51,6 +51,7 @@ from t_tech.invest import (
     OrderType,
 )
 from t_tech.invest.sandbox.async_client import AsyncSandboxClient
+from t_tech.invest.grpc import GetMaxLotsRequest
 from t_tech.invest.utils import now, quotation_to_decimal, decimal_to_quotation
 
 import config
@@ -336,20 +337,21 @@ class TinkoffClient:
         отдельного подтверждения.
         """
         try:
-            kwargs = {
+            request_kwargs = {
                 "account_id": self.account_id,
                 "instrument_id": figi,
             }
             if price is not None:
                 try:
-                    kwargs["price"] = decimal_to_quotation(Decimal(str(price)))
+                    request_kwargs["price"] = decimal_to_quotation(Decimal(str(price)))
                 except (InvalidOperation, TypeError, ValueError):
                     logging.warning(
                         f"[max_lots] {figi}: некорректная price={price!r} — "
                         f"запрос без price"
                     )
 
-            response = await self.client.sandbox.get_sandbox_max_lots(**kwargs)
+            request = GetMaxLotsRequest(**request_kwargs)
+            response = await self.client.sandbox.get_sandbox_max_lots(request=request)
 
             sell_max = None
             buy_max = None

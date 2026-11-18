@@ -156,3 +156,72 @@ async def test_process_closing_resolves_uncertain():
     pos.state = PositionState.UNCERTAIN
     await main.process_closing(client, mon)
     assert pos.state == PositionState.OPEN
+# Дополнение к tests/test_main.py
+
+@pytest.mark.asyncio
+async def test_trading_cycle_not_fill_but_executed_creates_position(monkeypatch):
+    """
+    status=NEW (не FILL), но get_sandbox_order_state показал lots_executed > 0
+    -> создаётся TrackedPosition (этап 4.1).
+    """
+    from t_tech.invest import OrderExecutionReportStatus
+    from unittest.mock import AsyncMock, MagicMock
+    from decimal import Decimal
+    from execution import ExecutionMonitor
+    from risk_manager import RiskManager
+    from tinkoff_client import PositionData
+
+    # Мок-клиент
+    fake = MagicMock()
+    fake.get_last_prices = AsyncMock(return_value={"F1": 54.25})
+    fake.get_positions = AsyncMock(return_value={})
+    fake.get_historical_candles = AsyncMock(return_value=[MagicMock()] * 100)
+    fake.get_instrument_info = AsyncMock(return_value={"lot": 1, "ticker": "MVID"})
+    fake.post_market_order = AsyncMock(return_value=MagicMock(
+        order_id="ord-1",
+        state=MagicMock(execution_report_status=OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_NEW),
+        error=None,
+    ))
+    # get_sandbox_order_state: lots_executed=359
+    fake.get_sandbox_order_state = AsyncMock(return_value=MagicMock(
+        lots_executed=359,
+        executed_order_price=MagicMock(units=54, nano=150000000),
+        executed_commission=None,
+    ))
+    fake.is_uncertain = MagicMock(return_value=False)
+
+    monitor = ExecutionMonitor(fake)
+    rm = RiskManager(fake)
+    sm = MagicMock()
+    sm.get_signal = MagicMock(return_value=("BUY", "MA(9/21) ↑"))
+    sm.last_signal_candle_time = None
+    sm.last_adx_value = None
+    sm._last_regime = None
+    sm._last_regime_candidate = None
+    sm._regime_streak = None
+
+    # Мок pandas.DataFrame
+    import pandas as pd
+    df = pd.DataFrame({"close": [54.25], "volume": [1000]})
+    fake.get_historical_candles = AsyncMock(return_value=[
+        MagicMock(time=pd.Timestamp("2026-11-17"), open=MagicMock(units=54, nano=0),
+                  high=MagicMock(units=54, nano=0), low=MagicMock(units=54, nano=0),
+                  close=MagicMock(units=54, nano=0), volume=1000, is_complete=True)
+    ] * 100)
+
+    rm.calculate_position_size = AsyncMock(return_value=359)
+    rm.calculate_sl_tp = MagicMock(return_value=(53.0, 56.0))
+    rm.record_trade = MagicMock()
+    rm.export_state = MagicMock(return_value={})
+    rm.import_state = MagicMock()
+
+    main.top_instruments = [{"figi": "F1", "ticker": "MVID"}]
+    main.reconcile_done = True
+    main.is_trading_enabled = MagicMock(return_value=True)
+    main._save_state = MagicMock(return_value=True)
+
+    await main.trading_cycle(fake, rm, sm, monitor)
+
+    # Проверка: TrackedPosition создан
+    assert monitor.get_position("F1") is not None
+    assert monitor.get_position("F1").quantity == 359

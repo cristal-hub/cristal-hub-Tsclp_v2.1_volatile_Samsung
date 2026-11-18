@@ -29,6 +29,11 @@ class FakeClient:
     async def get_sandbox_order_state(self, order_id):
         return self.order_states.get(order_id)
 
+    async def get_instrument_info(self, figi):
+        # Этап 5 (адопция RECOVERY в reconcile): метод требуется путю адопции
+        return {"lot": 1, "ticker": figi, "name": figi, "min_price_increment": 0.1,
+                "instrument_type": "share"}
+
     def is_uncertain(self):
         return self.uncertain_state
 
@@ -88,12 +93,24 @@ async def test_reconcile_empty_portfolio_clears_uncertain(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_reconcile_unknown_position_sets_uncertain(monkeypatch):
+async def test_reconcile_unknown_position_adopted_as_recovery(monkeypatch, tmp_path):
+    """Обновлён (пояснение в шапке скрипта/диффа): по согласованному поведению
+    позиция брокера без локального учёта адоптируется в RECOVERY через
+    единую точку регистрации, а не вечно остаётся MISMATCH/UNCERTAIN."""
     client = FakeClient(positions={"BBG004730N88": make_position(1)})
     mon = ExecutionMonitor(client)
+    monkeypatch.setattr(main, "STATE_FILE", str(tmp_path / "state.json"))
+    monkeypatch.setattr(main, "STATE_FILE_TMP", str(tmp_path / "state.json.tmp"))
     await main.reconcile(client, mon)
-    assert client.uncertain_state is True
-    assert main.reconcile_done is False
+    # Адопция: позиция зарегистрирована и управляема (RECOVERY)
+    pos = mon.get_position("BBG004730N88")
+    assert pos is not None
+    assert pos.state == PositionState.RECOVERY
+    assert pos.quantity == 1
+    assert pos.direction == "BUY"
+    # Направление/количество совпадают — свека завершена
+    assert client.uncertain_state is False
+    assert main.reconcile_done is True
 
 
 @pytest.mark.asyncio
@@ -107,14 +124,22 @@ async def test_reconcile_known_position_ok(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_reconcile_closed_but_present_is_unknown(monkeypatch):
+async def test_reconcile_closed_but_present_adopted_as_recovery(monkeypatch, tmp_path):
+    """Обновлён (пояснение в шапке скрипта/диффа): CLOSED-запись не является
+    активным учётом; присутствующая у брокера позиция адоптируется в RECOVERY."""
     client = FakeClient(positions={"FIGI": make_position(1)})
     mon = ExecutionMonitor(client)
     pos = register_buy(mon)
     pos.state = PositionState.CLOSED
+    monkeypatch.setattr(main, "STATE_FILE", str(tmp_path / "state.json"))
+    monkeypatch.setattr(main, "STATE_FILE_TMP", str(tmp_path / "state.json.tmp"))
     await main.reconcile(client, mon)
-    assert client.uncertain_state is True
-    assert main.reconcile_done is False
+    adopted = mon.get_position("FIGI")
+    assert adopted is not None
+    assert adopted.state == PositionState.RECOVERY
+    assert adopted.quantity == 1
+    assert client.uncertain_state is False
+    assert main.reconcile_done is True
 
 
 @pytest.mark.asyncio

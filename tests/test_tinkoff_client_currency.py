@@ -78,7 +78,8 @@ async def test_share_remainder_uncertain():
         "lot": 10, "instrument_type": "share", "ticker": "SBER", "name": "SBER",
     })
     result = await c.get_positions()
-    assert result == {}
+    # Обновлён: fail-closed — недостоверный снимок возвращается как None
+    assert result is None
     assert c.uncertain_state is True
 
 
@@ -127,5 +128,6 @@ async def test_currency_ok_share_error_preserved():
 
     c.get_instrument_info = AsyncMock(side_effect=fake_info)
     result = await c.get_positions()
-    assert result == {}  # акция не включена
+    # Обновлён: fail-closed — ошибка акции делает весь снимок недостоверным
+    assert result is None  # частичный dict не выдаётся наружу
     assert c.uncertain_state is True  # ошибка акции сохранена

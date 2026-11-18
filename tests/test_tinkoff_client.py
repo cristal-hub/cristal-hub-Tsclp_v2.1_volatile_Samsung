@@ -103,13 +103,16 @@ async def test_get_positions_lot_size_gt_1():
 
 @pytest.mark.asyncio
 async def test_get_positions_unresolved_remainder():
+    """Обновлён (пояснение в шапке скрипта/диффа): по согласованному
+    fail-closed поведению частичный/недостоверный снимок возвращается
+    как None, а не частичный dict."""
     c = make_client()
     c.client.sandbox.get_sandbox_portfolio = AsyncMock(
         return_value=FakePortfolio([FakePosition("F1", 15)])  # 15 штук
     )
     c.get_instrument_info = AsyncMock(return_value={"lot": 10})  # лот 10
     result = await c.get_positions()
-    assert result == {}  # позиция не возвращена
+    assert result is None  # снимок недостоверный: None, а не частичный dict
     assert c.uncertain_state is True
 
 
@@ -295,6 +298,10 @@ async def test_get_sandbox_max_lots_with_price():
     c.client.sandbox.get_sandbox_max_lots = mock
     await c.get_sandbox_max_lots("F1", price=100.5)
     args, kwargs = mock.call_args
-    assert "price" in kwargs
-    assert kwargs["price"].units == 100
-    assert kwargs["price"].nano == 500000000
+    # Обновлён: SDK принимает get_sandbox_max_lots(*, request: GetMaxLotsRequest);
+    # цена внутри request.price (проверено на реальном SDK).
+    assert "request" in kwargs
+    req = kwargs["request"]
+    assert req.instrument_id == "F1"
+    assert req.price.units == 100
+    assert req.price.nano == 500000000

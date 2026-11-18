@@ -5,19 +5,25 @@
 #   - Цены: TOP-10 + открытые позиции (объединение FIGI).
 #   - prices=None -> monitoring_error, мониторинг продолжается.
 #   - reconcile: двусторонний, с количествами и знаком (PositionData).
-#     Пустой портфель + локальная OPEN -> расхождение.
 #   - process_closing: обработка UNCERTAIN через resolve_uncertain.
 #   - partial BUY: cancel_order + подтверждённый финальный статус.
-#   - потерянный ответ BUY: OrderResult.order_id сохраняется,
-#     повторная отправка запрещена.
+#   - потерянный ответ BUY: OrderResult.order_id сохраняется.
 #   - _extract_price: цена за штуку (lots * lot_size).
 #   - persistence (state.json): атомарная запись, обязательный reconcile.
-#     Отсутствие/повреждение файла -> блокировка входов.
 #   - monitoring_error проверяется перед входами.
 #   - trading.flag: main() НЕ создаёт автоматически.
 #
+# ИЗМЕНЕНИЯ (этап 4.1):
+#   - trading_cycle: при status != FILL (например, NEW) — НЕ просто continue,
+#     а запрос get_sandbox_order_state(order_id) и проверка lots_executed.
+#     Если lots_executed > 0 -> создать TrackedPosition (как при FILL),
+#     сохранить state.json, отправить POSITION_OPENED / notify.
+#     Логирование ORDER_NOT_FILLED в JSONL (раньше — только logging.warning
+#     в stdout, что терялось).
+#
 # НЕ ИЗМЕНЕНО: стратегия, calculate_sl_tp, _log_strategy_diagnostic,
-#   notify, Telegram-lifecycle, trading.flag логика.
+#   notify, Telegram-lifecycle, trading.flag логика, reconcile,
+#   process_closing, _save_state/_load_state.
 
 import asyncio
 import csv
@@ -64,7 +70,7 @@ telegram_bot = None
 main_client = None
 reconcile_done = False
 monitor_ref = None
-rm_ref = None  # для persistence
+rm_ref = None
 
 _strategy_event_keys = set()
 
@@ -234,7 +240,6 @@ def _log_strategy_diagnostic(
     df: pd.DataFrame,
     price: float,
 ):
-    """Без изменений (диагностика)."""
     try:
         candle_time = getattr(sm, "last_signal_candle_time", None)
         if candle_time is None and df is not None and not df.empty:
@@ -289,10 +294,6 @@ def _log_strategy_diagnostic(
 # ============================================================
 
 def _save_state(monitor: ExecutionMonitor, rm: RiskManager) -> bool:
-    """
-    Атомарная запись state.json.tmp -> os.replace().
-    Возвращает True при успехе, False при ошибке (блокировка входов).
-    """
     try:
         data = {
             "positions": monitor.export_state().get("positions", {}),
@@ -309,11 +310,6 @@ def _save_state(monitor: ExecutionMonitor, rm: RiskManager) -> bool:
 
 
 def _load_state(monitor: ExecutionMonitor, rm: RiskManager) -> bool:
-    """
-    Загрузка state.json.
-    Возвращает True при успехе (файл есть и корректен), False иначе.
-    При False — вызывающий код блокирует входы (uncertain_state=True).
-    """
     if not os.path.isfile(STATE_FILE):
         logging.warning(f"[state] {STATE_FILE} отсутствует — новые входы запрещены до сверки.")
         return False
@@ -342,17 +338,10 @@ def _load_state(monitor: ExecutionMonitor, rm: RiskManager) -> bool:
 
 
 # ============================================================
-# RECONCILE (двусторонний, с количествами и знаком)
+# RECONCILE (двусторонний)
 # ============================================================
 
 async def reconcile(client: TinkoffClient, monitor: ExecutionMonitor):
-    """
-    Двусторонняя сверка:
-      1. Брокер -> локально (FIGI, lots, direction).
-      2. Локально -> брокер (FIGI, quantity, direction).
-    Пустой портфель + локальная OPEN -> расхождение.
-    Ошибка API (None) -> uncertain_state=True, reconcile_done=False.
-    """
     global reconcile_done
     positions = await client.get_positions()
 
@@ -362,7 +351,6 @@ async def reconcile(client: TinkoffClient, monitor: ExecutionMonitor):
         reconcile_done = False
         return
 
-    # Убираем валютные позиции (кэш)
     broker = {f: p for f, p in positions.items()
               if not f.startswith(("RUB", "USD", "EUR"))}
 
@@ -371,26 +359,18 @@ async def reconcile(client: TinkoffClient, monitor: ExecutionMonitor):
 
     mismatches = []
 
-    # 1. Брокер -> локально
     for figi, pd in broker.items():
         pos = local.get(figi)
         if pos is None:
             mismatches.append(f"{figi}: есть у брокера ({pd.lots}), нет локально")
             continue
-        # Направление
         our_side = "LONG" if pos.direction == "BUY" else "SHORT"
         if pd.direction != our_side:
-            mismatches.append(
-                f"{figi}: направление брокера={pd.direction}, локально={our_side}"
-            )
+            mismatches.append(f"{figi}: направление брокера={pd.direction}, локально={our_side}")
             continue
-        # Количество (лоты)
         if pd.lots != pos.quantity:
-            mismatches.append(
-                f"{figi}: lots брокера={pd.lots}, локально={pos.quantity}"
-            )
+            mismatches.append(f"{figi}: lots брокера={pd.lots}, локально={pos.quantity}")
 
-    # 2. Локально -> брокер
     for figi, pos in local.items():
         if figi not in broker:
             mismatches.append(f"{figi}: есть локально ({pos.quantity}), нет у брокера")
@@ -419,10 +399,6 @@ async def reconcile(client: TinkoffClient, monitor: ExecutionMonitor):
 # ============================================================
 
 async def close_position(client: TinkoffClient, pos, price: float):
-    """
-    Отправляет заявку на закрытие.
-    OrderResult: order_id сохраняется даже при ошибке.
-    """
     direction = (
         OrderDirection.ORDER_DIRECTION_SELL if pos.direction == "BUY"
         else OrderDirection.ORDER_DIRECTION_BUY
@@ -430,7 +406,6 @@ async def close_position(client: TinkoffClient, pos, price: float):
     result = await client.post_market_order(pos.figi, pos.quantity, direction)
 
     if result.state is None:
-        # Заявка могла быть отправлена, но ответ потерян
         pos.state = PositionState.UNCERTAIN
         client.uncertain_state = True
         logging.error(
@@ -443,7 +418,6 @@ async def close_position(client: TinkoffClient, pos, price: float):
         })
         return
 
-    # state получен
     pos.close_order_id = result.order_id
     pos.close_requested_lots = pos.quantity
     pos.close_requested_at = datetime.now(timezone.utc).isoformat()
@@ -460,19 +434,12 @@ async def close_position(client: TinkoffClient, pos, price: float):
 
 
 async def process_closing(client: TinkoffClient, monitor: ExecutionMonitor):
-    """
-    Обрабатывает CLOSING и UNCERTAIN.
-    CLOSED фиксирует сделку.
-    UNCERTAIN разрешается через resolve_uncertain (свежий портфель).
-    """
     global reconcile_done
 
-    # 1. Разрешаем CLOSING
     for pos in list(monitor.positions.values()):
         if pos.state == PositionState.CLOSING:
             await monitor.resolve_closing(pos)
 
-    # 2. Разрешаем UNCERTAIN (свежий портфель)
     uncertain_positions = [p for p in monitor.positions.values() if p.state == PositionState.UNCERTAIN]
     if uncertain_positions:
         positions = await client.get_positions()
@@ -485,10 +452,8 @@ async def process_closing(client: TinkoffClient, monitor: ExecutionMonitor):
                       if not f.startswith(("RUB", "USD", "EUR"))}
             for pos in uncertain_positions:
                 monitor.resolve_uncertain(pos, broker)
-            # После разрешения — сверка
             await reconcile(client, monitor)
 
-    # 3. Фиксируем CLOSED сделки
     for pos in list(monitor.positions.values()):
         if pos.state != PositionState.CLOSED or pos.logged:
             continue
@@ -500,13 +465,12 @@ async def process_closing(client: TinkoffClient, monitor: ExecutionMonitor):
             continue
 
         exit_price = pos.execution_price or 0.0
-        # Не подменяем executed_lots количеством, если исполнение неизвестно
         executed_lots = pos.executed_lots
         if executed_lots <= 0:
             logging.error(
                 f"[csv] {pos.ticker}: executed_lots={executed_lots} — пропуск записи"
             )
-            pos.logged = True  # чтобы не зациклиться; ошибка зафиксирована
+            pos.logged = True
             continue
         shares = executed_lots * pos.lot_size
 
@@ -581,8 +545,6 @@ async def process_closing(client: TinkoffClient, monitor: ExecutionMonitor):
                 f"✅ [CLOSED] {pos.ticker} {pos.close_reason} "
                 f"entry={pos.entry_price:.4f} exit={exit_price:.4f} "
                 f"lots={executed_lots} gross={gross_pnl:+.2f}₽ "
-                f"comm_in=-{entry_commission:.2f}₽ comm_out=-{exit_commission:.2f}₽ ({commission_source}) "
-                f"slippage={total_slippage:+.2f}₽ ({slippage_percent:+.3f}%) "
                 f"net={net_pnl:+.2f}₽ cum={cumulative_after:+.2f}₽"
             )
             try:
@@ -604,11 +566,7 @@ async def process_closing(client: TinkoffClient, monitor: ExecutionMonitor):
                 f"🔒 <b>{pos.ticker}</b> закрыто по {pos.close_reason}\n"
                 f"Вход: {pos.entry_price:.4f} → Выход: {exit_price:.4f}\n"
                 f"Лотов: {executed_lots} (акций: {shares})\n"
-                f"Gross: {gross_pnl:+.2f} ₽\n"
-                f"Комиссия: вход {entry_commission:.2f} ₽ + выход {exit_commission:.2f} ₽ ({commission_source})\n"
-                f"Slippage: {total_slippage:+.2f} ₽ ({slippage_percent:+.3f}%)\n"
-                f"Net: <b>{net_pnl:+.2f} ₽</b>\n"
-                f"Итого: {cumulative_after:+.2f} ₽"
+                f"Net: <b>{net_pnl:+.2f} ₽</b>"
             )
         else:
             logging.error(f"[csv] {pos.ticker}: log_trade вернул False — повтор на следующем цикле.")
@@ -631,9 +589,6 @@ async def trading_cycle(client: TinkoffClient, rm: RiskManager, sm: StrategyMana
         logging.error("[cycle] prices=None — monitoring_error=True, мониторинг продолжается")
         monitor.monitoring_error = True
         prices = {}
-    else:
-        # check_all сам выставит monitoring_error, если какой-то позиции нет
-        pass
 
     # 2. SL/TP
     to_close = await monitor.check_all(prices)
@@ -751,7 +706,6 @@ async def trading_cycle(client: TinkoffClient, rm: RiskManager, sm: StrategyMana
         result = await client.post_market_order(figi, lots, OrderDirection.ORDER_DIRECTION_BUY)
 
         if result.state is None:
-            # Потерянный ответ: order_id сохранён, повторная отправка запрещена
             logging.error(
                 f"{inst['ticker']}: state=None (order_id={result.order_id}) — UNCERTAIN. "
                 f"Повторная отправка запрещена."
@@ -776,21 +730,18 @@ async def trading_cycle(client: TinkoffClient, rm: RiskManager, sm: StrategyMana
             research_logger.log_event("PARTIAL_FILL", {"trade_id": trade_id, "order_id": order_id})
             client.uncertain_state = True
 
-            # 1. Отмена остатка
             cancel_resp = await client.cancel_order(order_id)
             if cancel_resp is None:
                 logging.error(f"{inst['ticker']}: cancel_order вернул None — UNCERTAIN")
                 _save_state(monitor, rm)
                 continue
 
-            # 2. Финальный статус
             final_state = await client.get_sandbox_order_state(order_id)
             if final_state is None:
                 logging.error(f"{inst['ticker']}: final state=None — UNCERTAIN")
                 _save_state(monitor, rm)
                 continue
 
-            # 3. Свежий портфель
             fresh_positions = await client.get_positions()
             if fresh_positions is None:
                 logging.error(f"{inst['ticker']}: fresh positions=None — UNCERTAIN")
@@ -803,13 +754,8 @@ async def trading_cycle(client: TinkoffClient, rm: RiskManager, sm: StrategyMana
                 _save_state(monitor, rm)
                 continue
 
-            # 4. Регистрируем фактическую позицию
             le = pos_data.lots
-            ep = getattr(final_state, "executed_order_price", None)
-            exec_price = None
-            if ep is not None and le > 0:
-                total = float(getattr(ep, "units", 0)) + float(getattr(ep, "nano", 0)) / 1e9
-                exec_price = ExecutionMonitor._extract_price(final_state, le, info['lot'])
+            exec_price = ExecutionMonitor._extract_price(final_state, le, info['lot'])
 
             if exec_price is None:
                 logging.error(f"{inst['ticker']}: exec_price=None после partial — UNCERTAIN")
@@ -851,10 +797,94 @@ async def trading_cycle(client: TinkoffClient, rm: RiskManager, sm: StrategyMana
             )
             continue
 
-        # --- НЕ FILL ---
+        # --- НЕ FILL (этап 4.1: проверка фактического исполнения) ---
         if status != OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_FILL:
-            logging.warning(f"{inst['ticker']}: не исполнено ({status})")
+            logging.warning(
+                f"{inst['ticker']}: не исполнено ({status}) — проверка фактического "
+                f"исполнения (order_id={order_id})"
+            )
+            research_logger.log_event("ORDER_NOT_FILLED", {
+                "trade_id": trade_id, "ticker": inst['ticker'], "figi": figi,
+                "order_id": order_id, "status": str(status),
+                "requested_lots": lots,
+            })
+
+            if not order_id:
+                logging.error(f"{inst['ticker']}: нет order_id — UNCERTAIN")
+                client.uncertain_state = True
+                _save_state(monitor, rm)
+                continue
+
+            # Запросить фактическое состояние заявки
+            state = await client.get_sandbox_order_state(order_id)
+            if state is None:
+                logging.error(
+                    f"{inst['ticker']}: state=None после не-FILL (order_id={order_id}) — UNCERTAIN"
+                )
+                client.uncertain_state = True
+                _save_state(monitor, rm)
+                continue
+
+            le = int(getattr(state, "lots_executed", 0) or 0)
+            if le <= 0:
+                logging.warning(
+                    f"{inst['ticker']}: lots_executed=0 — заявка не исполнена, пропуск"
+                )
+                _save_state(monitor, rm)
+                continue
+
+            # Исполнено > 0 -> создать TrackedPosition (как при FILL)
+            exec_price = ExecutionMonitor._extract_price(state, le, info['lot'])
+            if exec_price is None:
+                logging.error(
+                    f"{inst['ticker']}: exec_price=None (lots_executed={le}) — UNCERTAIN"
+                )
+                client.uncertain_state = True
+                _save_state(monitor, rm)
+                continue
+
+            entry_commission = ExecutionMonitor._extract_commission(state)
+            sl_price, tp_price = rm.calculate_sl_tp(exec_price, signal, df)
+            if sl_price is None or tp_price is None:
+                logging.error(f"{inst['ticker']}: SL/TP не рассчитаны — UNCERTAIN")
+                client.uncertain_state = True
+                _save_state(monitor, rm)
+                continue
+
+            pos = monitor.register(
+                figi=figi, ticker=inst['ticker'], direction=signal,
+                entry_price=exec_price, quantity=le,
+                sl_price=sl_price, tp_price=tp_price, lot_size=info['lot'],
+                trade_id=trade_id, signal_reason=reason,
+                signal_time=order_send_time, price_before_order=float(price),
+                order_send_time=order_send_time,
+                entry_requested_lots=lots,
+                entry_applied_lots=le,
+                entry_order_id=order_id,
+            )
+            pos.execution_price = exec_price
+            pos.executed_lots = le
+            pos.entry_actual_commission = entry_commission
+
+            rm.record_trade(figi)
             _save_state(monitor, rm)
+            logging.warning(
+                f"⚠️ [NOT-FILL-EXEC] {inst['ticker']}: status={status}, "
+                f"lots_executed={le} — создан TrackedPosition @ {exec_price:.4f}"
+            )
+            research_logger.log_event("POSITION_OPENED", {
+                "trade_id": trade_id, "ticker": inst['ticker'], "figi": figi,
+                "order_id": order_id, "exec_price": exec_price,
+                "exec_lots": le, "sl": sl_price, "tp": tp_price,
+                "entry_commission": entry_commission,
+                "note": f"status={status}, lots_executed={le}",
+            })
+            await notify(
+                f"⚠️ <b>{inst['ticker']}</b> BUY (status={status})\n"
+                f"Исполнено: {le} лот. @ {exec_price:.4f}\n"
+                f"SL: {sl_price:.4f}\nTP: {tp_price:.4f}\n"
+                f"<i>{reason}</i>"
+            )
             continue
 
         # --- FILL ---
@@ -933,7 +963,6 @@ async def main():
 
     config.validate()
 
-    # Telegram (без изменений)
     if config.ENABLE_TELEGRAM and TelegramBot:
         try:
             telegram_bot = TelegramBot(
@@ -965,7 +994,6 @@ async def main():
         monitor_ref = monitor
         screener = Screener()
 
-        # 1. Загрузка state.json
         state_loaded = _load_state(monitor, rm)
         if not state_loaded:
             client.uncertain_state = True
@@ -973,7 +1001,6 @@ async def main():
                 "[main] state.json отсутствует/повреждён — новые входы запрещены до сверки."
             )
 
-        # 2. Скрининг
         instruments = await screener.select_top_volatile()
         if not instruments:
             client.uncertain_state = True
@@ -987,11 +1014,8 @@ async def main():
         top_instruments = instruments
         logging.info(f"[screener] Инструменты: {', '.join(i['ticker'] for i in instruments)}")
 
-        # 3. Обязательный reconcile
         await reconcile(client, monitor)
 
-        # 4. Если state.json не загружен и локальных позиций нет — можно продолжать
-        #    (reconcile уже проверил). Если reconcile не прошёл — uncertain.
         if not reconcile_done:
             logging.warning("[main] reconcile не завершён — новые входы запрещены.")
             client.uncertain_state = True

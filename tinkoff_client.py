@@ -35,6 +35,21 @@
 #   Если lot_size неизвестен или <= 0 — UNKNOWN, uncertain_state=True.
 #
 # ЦЕНА ИСПОЛНЕНИЯ: _extract_price — в execution.py (этап 2), не здесь.
+#
+# ИЗМЕНЕНИЯ (этап 5, партия P0 — устранение потери учёта заявок):
+#   - post_market_order(..., order_id=None): order_id может быть передан
+#     вызывающим кодом (сгенерирован ДО записи INTENT в OrderLedger).
+#     None — прежнее поведение (генерация внутри клиента).
+#   - get_positions(): fail-closed при неполном снимке. Любая ошибка обработки
+#     строки портфеля (некорректное quantity, неизвестный lot_size, некратность,
+#     ошибка API по инструменту) делает СНИМОК НЕДОСТОВЕРНЫМ: возвращается None,
+#     а не частичный dict. Частичный ответ больше не может быть принят
+#     за полный портфель (дефект D5). Валютные позиции — пропуск без
+#     нарушения достоверности (как раньше).
+#   - get_positions()/get_sandbox_order_state(): таймаут API_REQUEST_TIMEOUT_SECONDS
+#     через asyncio.wait_for (дефект D8: зависание await-вызова без таймаута).
+#   - get_sandbox_orders() — новый метод: список АКТИВНЫХ заявок брокера
+#     (для четырёхсторонней сверки при рестарте). None при ошибке.
 
 import asyncio
 import logging
@@ -51,8 +66,17 @@ from t_tech.invest import (
     OrderType,
 )
 from t_tech.invest.sandbox.async_client import AsyncSandboxClient
-from t_tech.invest.grpc import GetMaxLotsRequest
 from t_tech.invest.utils import now, quotation_to_decimal, decimal_to_quotation
+
+# GetMaxLotsRequest: путь импорта различается между сборками SDK.
+#   SDK 1.51.0 (боевая сборка владельца): t_tech.invest.grpc.GetMaxLotsRequest.
+#   SDK 0.3.3 (публичная сборка PyPI): класс есть, но экспортируется
+#   из t_tech.invest (t_tech.invest.grpc.__init__ его не реэкспортирует).
+#   Оба пути ведут к одному классу protobuf; первичный путь — 1.51.0.
+try:
+    from t_tech.invest.grpc import GetMaxLotsRequest
+except ImportError:
+    from t_tech.invest import GetMaxLotsRequest
 
 import config
 
@@ -224,8 +248,13 @@ class TinkoffClient:
     async def get_positions(self) -> Optional[Dict[str, PositionData]]:
         """
         Возвращает dict[figi, PositionData] (лоты со знаком) при успехе.
-        None — при ошибке API (состояние НЕИЗВЕСТНО).
+        None — при ошибке API ИЛИ при неполном/недостоверном снимке (состояние НЕИЗВЕСТНО).
         {} — при успешном ответе с пустым портфелем.
+
+        FAIL-CLOSED (этап 5): частичный снимок недопустим. Если хотя бы одна
+        строка портфеля не может быть достоверно обработана — возвращается None.
+        Вызывающий код (reconcile/риск/входы) обязан трактовать None как
+        «портфель неизвестен» и не менять локальный учёт.
 
         Валютные позиции (instrument_type == "currency" или префикс FIGI
         RUB/USD/EUR) НЕ включаются в результат и НЕ проверяются на делимость.
@@ -241,15 +270,20 @@ class TinkoffClient:
           - direction: lots > 0 -> LONG, lots < 0 -> SHORT, lots == 0 -> FLAT
         """
         try:
-            portfolio = await self.client.sandbox.get_sandbox_portfolio(account_id=self.account_id)
+            portfolio = await asyncio.wait_for(
+                self.client.sandbox.get_sandbox_portfolio(account_id=self.account_id),
+                timeout=config.API_REQUEST_TIMEOUT_SECONDS,
+            )
             result: Dict[str, PositionData] = {}
+            snapshot_valid = True  # этап 5: снимок достоверен, пока не доказано обратное
             for pos in portfolio.positions:
                 figi = pos.figi
                 try:
                     shares = quotation_to_decimal(pos.quantity)
                 except (InvalidOperation, TypeError):
-                    logging.error(f"[positions] {figi}: некорректное quantity — UNCERTAIN")
+                    logging.error(f"[positions] {figi}: некорректное quantity — снимок недостоверный")
                     self.uncertain_state = True
+                    snapshot_valid = False
                     continue
 
                 if shares == 0:
@@ -275,30 +309,34 @@ class TinkoffClient:
 
                 # --- Торговый инструмент: строгая проверка ---
                 if not info or not info.get('lot'):
-                    logging.error(f"[positions] {figi}: lot_size неизвестен — UNCERTAIN")
+                    logging.error(f"[positions] {figi}: lot_size неизвестен — снимок недостоверный")
                     self.uncertain_state = True
+                    snapshot_valid = False
                     continue
 
                 lot_size = int(info['lot'])
                 if lot_size <= 0:
-                    logging.error(f"[positions] {figi}: lot_size={lot_size} <= 0 — UNCERTAIN")
+                    logging.error(f"[positions] {figi}: lot_size={lot_size} <= 0 — снимок недостоверный")
                     self.uncertain_state = True
+                    snapshot_valid = False
                     continue
 
                 try:
                     shares_dec = Decimal(shares)
                 except (InvalidOperation, TypeError):
-                    logging.error(f"[positions] {figi}: некорректное Decimal — UNCERTAIN")
+                    logging.error(f"[positions] {figi}: некорректное Decimal — снимок недостоверный")
                     self.uncertain_state = True
+                    snapshot_valid = False
                     continue
 
                 lot_size_dec = Decimal(lot_size)
                 if shares_dec % lot_size_dec != 0:
                     logging.error(
                         f"[positions] {figi}: shares={shares_dec} не кратно "
-                        f"lot_size={lot_size_dec} — UNCERTAIN, остаток не отбрасывается"
+                        f"lot_size={lot_size_dec} — снимок недостоверный, остаток не отбрасывается"
                     )
                     self.uncertain_state = True
+                    snapshot_valid = False
                     continue
 
                 lots = int(shares_dec // lot_size_dec)  # со знаком
@@ -314,10 +352,40 @@ class TinkoffClient:
                     direction=direction,
                     raw_shares=shares_dec,
                 )
+
+            if not snapshot_valid:
+                # Этап 5: частичный снимок НЕ выдаётся наружу.
+                logging.error(
+                    "[positions] Снимок портфеля неполный — возвращаю None "
+                    "(сверка/учёт по частичному снимку запрещены)"
+                )
+                return None
+
             return result
         except Exception as e:
             logging.error(f"Ошибка позиций (состояние неизвестно): {type(e).__name__}: {e}")
             self.uncertain_state = True
+            return None
+
+    async def get_sandbox_orders(self) -> Optional[list]:
+        """
+        Список АКТИВНЫХ заявок брокера (для стартовой четырёхсторонней сверки).
+
+        Возвращает список объектов OrderState при успехе,
+        None — при ошибке API (состояние неизвестно).
+
+        Используется ТОЛЬКО для восстановления учёта после перезапуска:
+        заявка, известная брокеру, но отсутствующая в OrderLedger, переводится
+        в UNCERTAIN с блокировкой BUY по её FIGI до разрешения.
+        """
+        try:
+            response = await asyncio.wait_for(
+                self.client.sandbox.get_sandbox_orders(account_id=self.account_id),
+                timeout=config.API_REQUEST_TIMEOUT_SECONDS,
+            )
+            return list(getattr(response, "orders", []) or [])
+        except Exception as e:
+            logging.error(f"Ошибка списка заявок (состояние неизвестно): {type(e).__name__}: {e}")
             return None
 
     async def get_sandbox_max_lots(self, figi: str, price: Optional[float] = None) -> Optional[dict]:
@@ -417,14 +485,21 @@ class TinkoffClient:
             logging.error(f"Ошибка диагностики позиций: {type(e).__name__}: {e}")
             return []
 
-    async def post_market_order(self, figi, quantity, direction) -> OrderResult:
+    async def post_market_order(self, figi, quantity, direction, order_id: Optional[str] = None) -> OrderResult:
         """
         Отправляет рыночную заявку.
         Возвращает OrderResult(order_id, state, error).
         order_id сохраняется ДАЖЕ при исключении (потеря ответа).
         Вызывающий код НЕ должен повторно отправлять заявку при state=None.
+
+        Этап 5: order_id может быть передан вызывающим кодом — он генерируется
+        ДО записи INTENT в OrderLedger, поэтому намерение и фактическая заявка
+        гарантированно имеют один и тот же идентификатор. При order_id=None
+        идентификатор генерируется здесь (прежнее поведение, совместимость).
         """
-        order_id = str(uuid.uuid4())
+        if not order_id:
+            order_id = str(uuid.uuid4())
+        order_id = str(order_id)
         try:
             response = await self.client.sandbox.post_sandbox_order(
                 account_id=self.account_id, figi=figi, quantity=quantity,
@@ -438,9 +513,23 @@ class TinkoffClient:
             return OrderResult(order_id=order_id, state=None, error=e)
 
     async def get_sandbox_order_state(self, order_id: str):
+        """
+        Статус заявки по order_id (источник истины — брокер).
+
+        Возвращает OrderState при успехе, None при ошибке/недоступности.
+        ВАЖНО (согласовано с владельцем): None — это «статус неизвестен».
+        Ответы «заявка не найдена» и сетевые ошибки НЕ являются доказательством
+        того, что заявка не отправлена: вызывающий код обязан трактовать None
+        как UNCERTAIN и разрешать отказ только по терминальному статусу
+        с executed_lots == 0, полученному от брокера.
+        Таймаут — API_REQUEST_TIMEOUT_SECONDS (защита от зависания цикла).
+        """
         try:
-            return await self.client.sandbox.get_sandbox_order_state(
-                account_id=self.account_id, order_id=order_id,
+            return await asyncio.wait_for(
+                self.client.sandbox.get_sandbox_order_state(
+                    account_id=self.account_id, order_id=order_id,
+                ),
+                timeout=config.API_REQUEST_TIMEOUT_SECONDS,
             )
         except Exception as e:
             logging.error(f"Ошибка статуса заявки {order_id}: {type(e).__name__}: {e}")

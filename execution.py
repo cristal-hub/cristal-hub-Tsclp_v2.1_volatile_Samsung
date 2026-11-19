@@ -1,6 +1,54 @@
 # execution.py
 # Tsclp_v2.2_volatile — мониторинг позиций.
 # Полная замена: совместимость с API Samsung + per-order учёт SELL.
+#
+# ИЗМЕНЕНИЯ (исправление потери первичной регистрации BUY — guard
+# register_executed_buy):
+#   - ExecutionMonitor хранит компактный реестр closed_entry_order_ids —
+#     entry_order_id закрытых BUY-позиций. Обоснование: monitor.positions
+#     держит только одну запись на FIGI; register()/register_recovery()
+#     перезаписывают CLOSED-запись новой позицией по тому же FIGI, и после
+#     перезапуска невозможно было отличить «старую закрытую сделку» от
+#     «новой незарегистрированной позиции». Без этого признака ослабление
+#     guard первичной регистрации (ledger FILL больше не считается
+#     доказательством применения лотов) открывало бы «воскрешение»
+#     закрытой сделки по позднему residual-отчёту. Реестр:
+#     - пополняется при перезаписи CLOSED-записи (register/register_recovery);
+#     - пополняется при экспорте state (все текущие CLOSED-записи);
+#     - сериализуется в state.json (export_state/import_state),
+#       обратная совместимость: ключ отсутствует в старом state.json —
+#       восстанавливается пустой список;
+#     - НЕ ограничен по размеру (дополнительный этап): прежний FIFO-лимит
+#       200 записей вытеснял признаки СТАРЫХ закрытых сделок — после 200
+#       закрытий поздний residual-отчёт вытесненной заявки больше не
+#       блокировался guard'ом register_executed_buy («воскрешение»
+#       закрытой позиции). Каждая запись — только короткий order_id,
+#       размер архива пренебрежим: безопасность важнее экономии байт.
+#   Торговая логика (SL/TP, закрытия, промоция) не менялась.
+#
+# ИЗМЕНЕНИЯ (этап BUY REGISTRATION FIX 3 — защита на уровне execution.py):
+#   apply_late_entry_lots() и record_recovery_entry_lots() отклоняют
+#   исполнение с ПУСТЫМ/ОТСУТСТВУЮЩИМ order_id (None, "", только пробелы):
+#   немедленный return False БЕЗ каких-либо изменений позиции (quantity,
+#   entry_price, entry_applied_lots, entry_order_id не трогаются).
+#   Обоснование: отсутствие достоверного идентификатора — НЕОПРЕДЕЛЁННОСТЬ,
+#   а не разрешение применить исполнение. Раньше проверка принадлежности
+#   (`if order_id and pos.entry_order_id and order_id != pos.entry_order_id`)
+#   при пустом order_id пропускалась, и дельта применялась к существующей
+#   позиции без какого-либо подтверждения, что исполнение относится именно
+#   к этой позиции. Теперь:
+#   - пустой/missing order_id — отклонение (лог + return False);
+#   - чужой (несовпадающий с entry_order_id) order_id — отклонение
+#     (как и прежде);
+#   - собственный корректный order_id — штатное применение дельты
+#     (как и прежде).
+#   Основная защита — в вызывающем коде main.py (register_executed_buy:
+#   guard BUY_EXEC_NO_ORDER_ID, uncertain_state, диагностика); эти проверки
+#   — защита в глубину на уровне самого модуля: даже при обходе вызывающего
+#   кода метод не применит лоты без идентификатора. Совместимость: все
+#   текущие вызовы (main.py: register_executed_buy OPEN/RECOVERY-ветки,
+#   promote_recovery_positions) передают непустой order_id, проверенный
+#   вызывающим кодом; поведение остальных методов не менялось.
 import logging
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -82,10 +130,24 @@ class TrackedPosition:
 
 
 class ExecutionMonitor:
+    # Компактный реестр entry_order_id закрытых BUY-позиций (см. шапку);
+    # без лимита размера — обрезка теряла признаки старых закрытых сделок.
+
     def __init__(self, client):
         self.client = client
         self.positions: Dict[str, TrackedPosition] = {}
         self.monitoring_error = False
+        self.closed_entry_order_ids: List[str] = []
+
+    def _archive_closed_entry_order(self, pos: TrackedPosition) -> None:
+        """Сохраняет признак закрытой сделки (entry_order_id) перед
+        перезаписью CLOSED-записи новой позицией по тому же FIGI."""
+        if pos is None or pos.state != PositionState.CLOSED or not pos.entry_order_id:
+            return
+        if pos.entry_order_id not in self.closed_entry_order_ids:
+            self.closed_entry_order_ids.append(pos.entry_order_id)
+            # Дополнительный этап: без обрезки архива — вытесненный признак
+            # закрытой сделки терял защиту guard'а от «воскрешения».
 
     def register(self, **kwargs) -> TrackedPosition:
         figi = kwargs.get("figi")
@@ -96,6 +158,7 @@ class ExecutionMonitor:
                 f"({existing.state.value}); overwrite denied"
             )
             return existing
+        self._archive_closed_entry_order(self.positions.get(figi))
         pos = TrackedPosition(**kwargs)
         if not self._valid_position(pos):
             raise ValueError("Некорректные параметры позиции")
@@ -125,6 +188,7 @@ class ExecutionMonitor:
             return self.positions[figi]
         if direction not in ("BUY", "SELL") or int(quantity) <= 0 or int(lot_size) <= 0:
             raise ValueError("Некорректная RECOVERY-позиция")
+        self._archive_closed_entry_order(self.positions.get(figi))
         pos = TrackedPosition(
             figi=figi, ticker=ticker, direction=direction, entry_price=0.0,
             quantity=int(quantity), sl_price=0.0, tp_price=0.0,
@@ -181,6 +245,21 @@ class ExecutionMonitor:
     def record_recovery_entry_lots(self, pos, executed_lots, order_id=None, already_seen_lots=None):
         if pos.state != PositionState.RECOVERY or pos.direction != "BUY":
             return False
+        # Этап BUY REGISTRATION FIX 3 (защита в глубину): исполнение БЕЗ
+        # достоверного order_id отклоняется целиком — отсутствие
+        # идентификатора это НЕОПРЕДЕЛЁННОСТЬ, а НЕ разрешение применить
+        # лоты. Позиция не изменяется (quantity/entry_price/
+        # entry_applied_lots не трогаются); разрешение неопределённости —
+        # вызывающим кодом (uncertain_state + диагностика) и сверкой.
+        if not str(order_id or "").strip():
+            logging.error(
+                f"[execution] record_recovery_entry_lots: отклонено — "
+                f"исполнение без достоверного order_id "
+                f"(figi={pos.figi}, ticker={pos.ticker}, "
+                f"entry_order_id={pos.entry_order_id or '—'}, "
+                f"executed_lots={executed_lots}) — лоты НЕ применены"
+            )
+            return False
         if order_id and pos.entry_order_id and order_id != pos.entry_order_id:
             return False
         try:
@@ -209,6 +288,22 @@ class ExecutionMonitor:
 
     def apply_late_entry_lots(self, pos, executed_lots, order_id=None):
         if pos.state != PositionState.OPEN or pos.direction != "BUY":
+            return False
+        # Этап BUY REGISTRATION FIX 3 (защита в глубину): исполнение БЕЗ
+        # достоверного order_id отклоняется целиком — отсутствие
+        # идентификатора это НЕОПРЕДЕЛЁННОСТЬ, а НЕ разрешение применить
+        # лоты к уже открытой позиции. Позиция не изменяется (quantity/
+        # entry_price/entry_applied_lots не трогаются); разрешение
+        # неопределённости — вызывающим кодом (uncertain_state +
+        # диагностика) и сверкой.
+        if not str(order_id or "").strip():
+            logging.error(
+                f"[execution] apply_late_entry_lots: отклонено — "
+                f"исполнение без достоверного order_id "
+                f"(figi={pos.figi}, ticker={pos.ticker}, "
+                f"entry_order_id={pos.entry_order_id or '—'}, "
+                f"executed_lots={executed_lots}) — лоты НЕ применены"
+            )
             return False
         if order_id and pos.entry_order_id and order_id != pos.entry_order_id:
             return False
@@ -442,15 +537,32 @@ class ExecutionMonitor:
         return sum(p.state in ACTIVE_STATES for p in self.positions.values())
 
     def export_state(self):
+        # Компактный реестр закрытых входных заявок: архив перезаписанных
+        # записей + все текущие CLOSED-записи (дедуп; БЕЗ лимита размера —
+        # обрезка теряла признаки старых закрытых сделок, см. шапку).
+        closed_ids = list(self.closed_entry_order_ids)
+        for pos in self.positions.values():
+            if pos.state == PositionState.CLOSED and pos.entry_order_id:
+                if pos.entry_order_id not in closed_ids:
+                    closed_ids.append(pos.entry_order_id)
         return {
             "positions": {figi: pos.to_dict() for figi, pos in self.positions.items()},
             "monitoring_error": self.monitoring_error,
+            "closed_entry_order_ids": closed_ids,
         }
 
     def import_state(self, data):
         if not isinstance(data, dict):
             logging.error("[execution] import_state: data is not dict")
             return
+        # Обратная совместимость: старый state.json без ключа -> пустой список.
+        raw_closed = data.get("closed_entry_order_ids", [])
+        if isinstance(raw_closed, list):
+            # Дополнительный этап: полный импорт без обрезки — все признаки
+            # закрытых сделок должны переживать перезапуск.
+            self.closed_entry_order_ids = [str(x) for x in raw_closed if x]
+        else:
+            self.closed_entry_order_ids = []
         restored = {}
         positions = data.get("positions", {})
         if not isinstance(positions, dict):

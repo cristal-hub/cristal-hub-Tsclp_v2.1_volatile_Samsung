@@ -3914,3 +3914,38 @@
 {"timestamp_utc": "2026-11-18T18:07:24.622608+00:00", "event": "TG_INCOMING", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "user_id": 747245263, "username": "domenictorrento", "text": "/stop", "authorized": true}
 {"timestamp_utc": "2026-11-18T18:07:24.623608+00:00", "event": "TRADING_STOP", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER"}
 {"timestamp_utc": "2026-11-18T18:07:37.928801+00:00", "event": "TG_INCOMING", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "user_id": 747245263, "username": "domenictorrento", "text": "/status", "authorized": true}
+{"timestamp_utc": "2026-11-19T18:28:43.202288+00:00", "event": "RECONCILE_OK", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "positions": 0}
+{"timestamp_utc": "2026-11-19T18:28:43.228289+00:00", "event": "STATE_SAVE_FAILED", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER"}
+{"timestamp_utc": "2026-11-19T18:28:43.286290+00:00", "event": "RECONCILE_OK", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "positions": 1}
+{"timestamp_utc": "2026-11-19T18:28:43.296289+00:00", "event": "RECONCILE_MISMATCH", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "mismatches": ["F1: есть локально (1), нет у брокера"]}
+{"timestamp_utc": "2026-11-19T18:28:43.303288+00:00", "event": "RECONCILE_MISMATCH", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "mismatches": ["F1: lots брокера=2, локально=1"]}
+{"timestamp_utc": "2026-11-19T18:28:43.311289+00:00", "event": "RECONCILE_MISMATCH", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "mismatches": ["F1: направление брокера=SHORT, локально=LONG"]}
+{"timestamp_utc": "2026-11-19T18:28:43.332292+00:00", "event": "RECONCILE_OK", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "positions": 0}
+{"timestamp_utc": "2026-11-19T18:28:43.409289+00:00", "event": "RECONCILE_OK", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "positions": 1}
+{"timestamp_utc": "2026-11-19T18:28:44.070299+00:00", "event": "RECONCILE_OK", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "positions": 0}
+{"timestamp_utc": "2026-11-19T18:28:44.076301+00:00", "event": "RECONCILE_OK", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "positions": 0}
+{"timestamp_utc": "2026-11-19T18:28:44.086300+00:00", "event": "POSITION_RECOVERED", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "figi": "BBG004730N88", "ticker": "BBG004730N88", "direction": "BUY", "lots": 1, "source": "reconcile_adoption"}
+{"timestamp_utc": "2026-11-19T18:28:44.087301+00:00", "event": "RECONCILE_OK", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "positions": 1}
+{"timestamp_utc": "2026-11-19T18:28:44.095302+00:00", "event": "RECONCILE_OK", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "positions": 1}
+{"timestamp_utc": "2026-11-19T18:28:44.108299+00:00", "event": "POSITION_RECOVERED", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "figi": "FIGI", "ticker": "FIGI", "direction": "BUY", "lots": 1, "source": "reconcile_adoption"}
+{"timestamp_utc": "2026-11-19T18:28:44.109298+00:00", "event": "RECONCILE_OK", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "positions": 1}
+{"timestamp_utc": "2026-11-19T18:28:44.118299+00:00", "event": "RECONCILE_OK", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "positions": 1}
+{"timestamp_utc": "2026-11-19T18:28:44.119300+00:00", "event": "RECONCILE_OK", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "positions": 1}
+{"timestamp_utc": "2026-11-19T18:29:00.800028+00:00", "event": "TG_INCOMING", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "user_id": 12345, "username": "user", "text": "/start", "authorized": true}
+{"timestamp_utc": "2026-11-19T18:29:00.801029+00:00", "event": "TG_INCOMING", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "user_id": 99999, "username": "user", "text": "/start", "authorized": false}
+{"timestamp_utc": "2026-11-19T18:29:00.808029+00:00", "event": "TG_INCOMING", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "user_id": 12345, "username": "user", "text": "/start", "authorized": false}
+{"timestamp_utc": "2026-11-19T18:29:01.876056+00:00", "event": "TG_INCOMING", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "user_id": 12345, "username": "user", "text": "/start", "authorized": true}
+{"timestamp_utc": "2026-11-19T18:29:01.886057+00:00", "event": "TG_INCOMING", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "user_id": 99999, "username": "user", "text": "/start", "authorized": false}
+{"timestamp_utc": "2026-11-19T18:29:01.892057+00:00", "event": "TG_INCOMING", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "user_id": 12345, "username": "user", "text": "/start", "authorized": false}
+{"timestamp_utc": "2026-11-19T18:29:01.912057+00:00", "event": "TG_INCOMING", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "user_id": 12345, "username": "user", "text": "/start", "authorized": true}
+{"timestamp_utc": "2026-11-19T18:29:01.925057+00:00", "event": "TG_INCOMING", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "user_id": 12345, "username": "user", "text": "/stop", "authorized": true}
+{"timestamp_utc": "2026-11-19T18:29:01.940059+00:00", "event": "TG_INCOMING", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "user_id": 12345, "username": "user", "text": "/status", "authorized": true}
+{"timestamp_utc": "2026-11-19T18:29:01.954056+00:00", "event": "TG_INCOMING", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "user_id": 99999, "username": "user", "text": "/start", "authorized": false}
+{"timestamp_utc": "2026-11-19T18:29:01.973058+00:00", "event": "TG_INCOMING", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "user_id": 99999, "username": "user", "text": "/stop", "authorized": false}
+{"timestamp_utc": "2026-11-19T18:29:01.987054+00:00", "event": "TG_INCOMING", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "user_id": 99999, "username": "user", "text": "/status", "authorized": false}
+{"timestamp_utc": "2026-11-19T18:29:02.583897+00:00", "event": "TRADING_START", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER"}
+{"timestamp_utc": "2026-11-19T18:29:02.591898+00:00", "event": "TRADING_START", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER"}
+{"timestamp_utc": "2026-11-19T18:29:02.592898+00:00", "event": "TRADING_STOP", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER"}
+{"timestamp_utc": "2026-11-19T18:29:02.605898+00:00", "event": "TRADING_START", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER"}
+{"timestamp_utc": "2026-11-19T18:29:02.656899+00:00", "event": "TRADING_START", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER"}
+{"timestamp_utc": "2026-11-19T18:29:02.658900+00:00", "event": "TRADING_STOP", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER"}

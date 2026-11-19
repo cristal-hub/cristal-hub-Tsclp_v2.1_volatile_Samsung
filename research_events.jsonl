@@ -3949,3 +3949,6 @@
 {"timestamp_utc": "2026-11-19T18:29:02.605898+00:00", "event": "TRADING_START", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER"}
 {"timestamp_utc": "2026-11-19T18:29:02.656899+00:00", "event": "TRADING_START", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER"}
 {"timestamp_utc": "2026-11-19T18:29:02.658900+00:00", "event": "TRADING_STOP", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER"}
+{"timestamp_utc": "2026-11-19T20:03:46.394007+00:00", "event": "STARTUP_RECOVERY", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "positions_adopted": 0, "positions_unavailable": false, "unknown_broker_orders": 0, "orders_unavailable": false, "orders_executed": 2, "orders_resolved": 0, "orders_uncertain": 0, "orders_active": 0}
+{"timestamp_utc": "2026-11-19T20:04:35.578252+00:00", "event": "TG_INCOMING", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "user_id": 747245263, "username": "domenictorrento", "text": "/status", "authorized": true}
+{"timestamp_utc": "2026-11-19T20:05:50.534892+00:00", "event": "STARTUP_RECOVERY", "config_profile": "FORCE_TRADE", "commission_mode": "TRADER", "positions_adopted": 0, "positions_unavailable": false, "unknown_broker_orders": 0, "orders_unavailable": false, "orders_executed": 0, "orders_resolved": 0, "orders_uncertain": 2, "orders_active": 0}

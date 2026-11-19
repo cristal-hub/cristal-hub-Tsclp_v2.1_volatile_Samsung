@@ -31,7 +31,9 @@
       "entry_snapshot_synced": true,
       "close_requested_lots": 0,
       "close_applied_lots": 0,
-      "recovery_source": "adopted"
+      "recovery_source": "adopted",
+      "close_orders": {},
+      "close_applications": []
     },
     "BBG004TC84Z8": {
       "figi": "BBG004TC84Z8",
@@ -64,9 +66,12 @@
       "entry_snapshot_synced": true,
       "close_requested_lots": 0,
       "close_applied_lots": 0,
-      "recovery_source": "adopted"
+      "recovery_source": "adopted",
+      "close_orders": {},
+      "close_applications": []
     }
   },
+  "closed_entry_order_ids": [],
   "monitoring_error": false,
   "risk": {
     "daily_trade_counts": {},
@@ -74,8 +79,8 @@
   },
   "open_orders": [
     {
-      "timestamp_utc": "2026-11-18T18:03:34.982521+00:00",
-      "status": "FILL",
+      "timestamp_utc": "2026-11-19T20:03:45.892872+00:00",
+      "status": "UNCERTAIN",
       "order_id": "fd3d3670-340a-4938-a261-ab595f6e4f70",
       "trade_id": "c4b1401b9646",
       "figi": "TCS00A105EX7",
@@ -85,15 +90,15 @@
       "executed_lots": 495,
       "lots_left": null,
       "avg_exec_price": null,
-      "reason": "",
-      "source": "post_response",
+      "reason": "отчёт заявки НЕ привязан к RECOVERY-позиции: trade_id заявки не совпадает с trade_id позиции (или неизвестен) — принадлежность не подтверждена, исполнение к позиции не применяется, требуется сверка/решение оператора",
+      "source": "startup_recovery_fill",
       "error": null,
       "created_at_utc": "2026-11-18T18:03:34.720146+00:00",
-      "updated_at_utc": "2026-11-18T18:03:34.982521+00:00"
+      "updated_at_utc": "2026-11-19T20:03:45.892872+00:00"
     },
     {
-      "timestamp_utc": "2026-11-18T18:05:14.798366+00:00",
-      "status": "FILL",
+      "timestamp_utc": "2026-11-19T20:03:46.016160+00:00",
+      "status": "UNCERTAIN",
       "order_id": "85e419de-06e3-4596-8ee2-32e4a42dcfbf",
       "trade_id": "dc172096a69f",
       "figi": "BBG004TC84Z8",
@@ -103,11 +108,11 @@
       "executed_lots": 27,
       "lots_left": null,
       "avg_exec_price": null,
-      "reason": "",
-      "source": "post_response",
+      "reason": "отчёт заявки НЕ привязан к RECOVERY-позиции: trade_id заявки не совпадает с trade_id позиции (или неизвестен) — принадлежность не подтверждена, исполнение к позиции не применяется, требуется сверка/решение оператора",
+      "source": "startup_recovery_fill",
       "error": null,
       "created_at_utc": "2026-11-18T18:05:14.585184+00:00",
-      "updated_at_utc": "2026-11-18T18:05:14.798366+00:00"
+      "updated_at_utc": "2026-11-19T20:03:46.016160+00:00"
     }
   ]
 }

@@ -4,7 +4,7 @@ import sys
 import types
 from pathlib import Path
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).resolve().parent.parent
 sys.modules.setdefault("config", types.ModuleType("config"))
 spec = importlib.util.spec_from_file_location("execution_under_test", ROOT / "execution.py")
 mod = importlib.util.module_from_spec(spec)
@@ -12,7 +12,7 @@ spec.loader.exec_module(mod)
 
 PS = mod.PositionState
 class Client:
-    async def get_sandbox_order_state(self, oid):
+    async def get_sandbox_order_state(self, oid, order_id_type=None):
         return None
 
 def make_position(qty=10):
@@ -39,13 +39,23 @@ def test_partial_sell_then_second_sell_uses_own_cursor():
     )
     assert p.quantity == 6
     assert p.close_orders["SELL1"]["applied_lots"] == 4
-    # terminal cancellation; leftover 6 shares stay open
+    # terminal cancellation; leftover 6 shares NOT re-opened yet:
+    # v2.3.3-stage1 — остаток разрешается в OPEN только после подтверждения
+    # брокерским снимком (resolve_uncertain); завершённая заявка очищена.
     mod.ExecutionMonitor.apply_close_execution(
         mod.ExecutionMonitor(None), p, "SELL1", 4, "CANCELLED",
         requested_lots=10
     )
     assert p.quantity == 6
+    assert p.state == PS.UNCERTAIN
+    assert p.close_order_id is None
+    # брокер подтверждает остаток 6 лотов — штатное разрешение остатка
+    m1 = mod.ExecutionMonitor(None)
+    m1.resolve_uncertain(
+        p, {"FIGI1": types.SimpleNamespace(lots=6, direction="LONG")}
+    )
     assert p.state == PS.OPEN
+    assert p.quantity == 6
     # second order has a fresh cursor
     p.close_order_id = "SELL2"
     p.close_requested_lots = 6
@@ -85,12 +95,26 @@ def test_zero_remaining_closes_position():
     assert p.state == PS.CLOSED
 
 def test_terminal_partial_sell_reopens_remaining_position():
+    """v2.3.3-stage1: CANCELLED с частичным исполнением учитывает лоты
+    per-order cursor'ом и очищает заявку, но остаток разрешается в OPEN
+    ТОЛЬКО после подтверждения брокерским снимком (resolve_uncertain).
+    Прежнее немедленное OPEN позволяло SL/TP отправить новую SELL до
+    сверки остатка с брокером (риск перепродажи)."""
     _, p = make_position(7)
     m = mod.ExecutionMonitor(None)
     m.add_close_order(p, "S1", 7)
     m.apply_close_execution(p, "S1", 3, "CANCELLED", requested_lots=7)
     assert p.quantity == 4
+    assert p.state == PS.UNCERTAIN       # НЕ OPEN: сначала сверка с брокером
+    assert p.close_order_id is None      # завершённая заявка очищена
+    assert p.close_orders["S1"]["status"] == "CANCELLED"
+    assert p.close_orders["S1"]["applied_lots"] == 3
+    # брокер подтверждает остаток 4 лота — штатное разрешение остатка
+    m.resolve_uncertain(
+        p, {"FIGI1": types.SimpleNamespace(lots=4, direction="LONG")}
+    )
     assert p.state == PS.OPEN
+    assert p.quantity == 4
 
 def test_lower_cumulative_is_uncertain_without_quantity_change():
     _, p = make_position(7)

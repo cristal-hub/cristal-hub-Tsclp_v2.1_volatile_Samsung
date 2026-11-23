@@ -1,6 +1,23 @@
 # main.py
 # Tsclp_v2.2_volatile — основной цикл (ТОЛЬКО ПЕСОЧНИЦА).
 #
+# ИЗМЕНЕНИЯ (v2.3.3-stage1 — дефект «повторное открытие позиции при
+# активной частичной SELL»):
+#   - process_closing: защита в глубину после resolve_uncertain — позиция
+#     с неподтверждённой терминальностью close-заявки (close_order_id
+#     установлен) не может остаться в OPEN ни одним путём: немедленный
+#     возврат в UNCERTAIN с ошибкой в журнале. SL/TP (check_all) действуют
+#     только на OPEN, поэтому повторная SELL по позиции с живой заявкой
+#     исключена. Основное исправление — в execution.py (resolve_uncertain
+#     не переводит позицию в OPEN при совпадении количества с брокером,
+#     пока SELL-заявка не подтверждена терминальным отчётом;
+#     apply_close_execution разрешает остаток после терминала только
+#     через брокерский снимок; resolve_closing при REJECTED/CANCELLED
+#     без исполнения больше не возвращает OPEN немедленно) — см. шапку
+#     execution.py. Торговая логика (входы, индикаторы, SL/TP,
+#     риск-модель) не менялась; OrderLedger, P0-5, per-order cursor,
+#     fail-closed и журналы не тронуты.
+#
 # ИЗМЕНЕНИЯ (этап 4):
 #   - Цены: TOP-10 + открытые позиции (объединение FIGI).
 #   - prices=None -> monitoring_error, мониторинг продолжается.
@@ -275,6 +292,104 @@
 #   (_load_state изменена ТОЛЬКО добавлением восстановления ключа
 #   closed_entry_order_ids — см. блок выше.) Режим — ТОЛЬКО ПЕСОЧНИЦА
 #   (SANDBOX).
+#
+# ИЗМЕНЕНИЯ (v2.3.0-stage1 — пакет В: самовосстановление учёта; + С1):
+#   В1. state.json сохраняется В КОНЦЕ КАЖДОГО цикла trading_cycle.
+#       Раньше тихий цикл (HOLD, без входов/ошибок) не сохранял
+#       CLOSED/CLOSING-переходы: рестарт возвращал проданные позиции как
+#       фантомные OPEN -> вечный RECONCILE_MISMATCH (главный генератор
+#       «локальных расхождений»).
+#   В2. reconcile: локальная активная позиция отсутствует у брокера, но есть
+#       СВОЯ SELL-заявка закрытия (pos.close_order_id или запись реестра,
+#       созданная ПОСЛЕ входа) -> учёт закрывается штатно
+#       (POSITION_CLOSED_BY_LEDGER), CSV-строка пишется с реальной ценой
+#       исполнения. Окна «закрытие офлайн / крах между отправкой SELL и
+#       сохранением» самоизлечиваются без оператора.
+#   В3. reconcile: та же ситуация БЕЗ своей SELL-заявки (позиция продана
+#       вне робота) -> двойное подтверждение на двух последовательных
+#       сверках -> учёт закрывается как EXTERNAL_CLOSE с приблизительной
+#       ценой выхода на момент обнаружения (POSITION_CLOSED_EXTERNAL,
+#       CSV с пометкой в error_note). Вечная заморозка при ручной продаже
+#       устранена; расхождения по количеству/направлению по-прежнему
+#       замораживают входы (там неоднозначность настоящая).
+#   В4. RECOVERY-позиция без entry_order_id (адоптированная) привязывается
+#       к ЕДИНСТВЕННОМУ терминальному BUY-отчёту по FIGI с
+#       executed_lots == quantity (RECOVERY_ENTRY_BOUND); UNCERTAIN-запись
+#       этой заявки снимается, промоция RECOVERY->OPEN идёт штатно.
+#       Защита от «воскрешения» сохранена (closed_entry_order_ids).
+#   С1. Безубыток/трейлинг (config.BE_TRAIL_ENABLED=False по умолчанию):
+#       свечные экстремумы MAE/MFE -> триггер BE по r_peak от достигнутого
+#       максимума -> трейлинг; классификация выходов SL/BE/TRAIL; новые
+#       поля CSV с авто-миграцией старого research_trades.csv в .bak.
+#       Порядок вызовов trading_cycle/reconcile/poll_open_orders НЕ менялся.
+#
+# ИЗМЕНЕНИЯ (v2.3.1-stage1 — аудит ТЗ v2.3):
+#   ТЗ-1/2. reconcile вызывается В КАЖДОМ штатном цикле trading_cycle (шаг 4),
+#       а не только при uncertain_state/UNCERTAIN-позициях/на старте.
+#       Причина дефекта v2.3: ручная продажа позиции в приложении брокера
+#       не выставляет ни uncertain_state, ни UNCERTAIN-позиции — пакет
+#       В2/В3 (живущий внутри reconcile) не срабатывал в штатном цикле,
+#       фантомная OPEN-позиция мониторилась до рестарта, при SL/TP
+#       отправлялись обречённые SELL-заявки. Теперь исчезновение позиции
+#       обнаруживается по ДОСТОВЕРНОМУ снимку брокера в каждом цикле.
+#       Недостоверный снимок (get_positions()=None) учёт не меняет —
+#       как и прежде (D5).
+#   ТЗ-3. Двойное подтверждение В3 сохранено и усилено:
+#       а) подтверждение принимается не раньше, чем через
+#          config.RECONCILE_CONFIRM_MIN_AGE_SECONDS (= один цикл) после
+#          первого обнаружения — два reconcile в одном цикле
+#          (process_closing + шаг 4) подтверждением не считаются;
+#       б) кандидат на внешнее закрытие СНИМАЕТСЯ, если позиция снова
+#          видна у брокера (иначе «протухший» first_seen дал бы мгновенное
+#          подтверждение при будущем исчезновении по одному снимку).
+#   ТЗ-4/5. Запрет фиктивного P&L: TrackedPosition.exit_price_confirmed
+#       (execution.py) — True только при цене из реального исполненного
+#       close-ордера. process_closing: UNCERTAIN-позиция с close_order_id
+#       сначала разрешается по отчёту заявки (resolve_closing — реальная
+#       цена исполнения даже «офлайн»-закрытия); CSV-строка при
+#       неподтверждённой цене пишется с ПУСТЫМИ P&L-полями и пометкой
+#       PRICE_UNKNOWN в error_note, cumulative не искажается. Частичное
+#       исполнение SELL: учёт закрывается только по подтверждённым лотам,
+#       остаток — с пометкой в error_note (прежнее поведение В2).
+#
+# ИЗМЕНЕНИЯ (v2.3.2-stage1 — аудит v2.3.1: два блокирующих дефекта закрытия):
+#
+#   Дефект 1. Нетерминальная SELL-заявка (_try_resolve_absent_position, В2).
+#       РАНЬШЕ: если запись реестра/отчёт брокера давали executed_lots>0 при
+#       НЕТЕРМИНАЛЬНОМ статусе (NEW/PARTIALLYFILL/неизвестен), учёт позиции
+#       закрывался немедленно (LEDGER_CLOSE по частично исполненной ЖИВОЙ
+#       заявке) — исполнение могло продолжиться/отмениться после закрытия
+#       учёта.
+#       ТЕПЕРЬ: окончательным исполнением считается ТОЛЬКО терминальный
+#       статус (FILL/CANCELLED/REJECTED/EXPIRED). Нетерминальный статус с
+#       executed_lots>0 -> новое действие "uncertain": учёт НЕ закрывается,
+#       позиция переводится в UNCERTAIN, повторная отправка SELL не
+#       выполняется, новые входы блокируются (mismatch-путь reconcile).
+#       Разрешение — только терминальный отчёт этой заявки (В2 закроет учёт
+#       с подтверждённой ценой) или достоверный отказ без исполнения (В3).
+#
+#   Дефект 2. Обход двойного подтверждения через UNCERTAIN
+#       (resolve_uncertain в execution.py + process_closing в main.py).
+#       РАНЬШЕ: UNCERTAIN-позиция, отсутствующая у брокера, закрывалась
+#       немедленно по ОДНОМУ достоверному снимку (мгновенный CLOSED,
+#       EXTERNAL_CLOSE) — в обход механизма В3 (два достоверных снимка с
+#       минимальным интервалом) и без подтверждения исхода собственной
+#       SELL-заявки.
+#       ТЕПЕРЬ: resolve_uncertain при отсутствии позиции у брокера учёт НЕ
+#       закрывает — позиция остаётся UNCERTAIN. Все пути закрытия
+#       UNCERTAIN-позиции:
+#         а) СВОЯ SELL-заявка: терминальный отчёт (resolve_closing ->
+#            apply_close_execution, per-order cursor, идемпотентно) или В2
+#            в reconcile — учёт закрывается с РЕАЛЬНОЙ ценой исполнения;
+#         б) внешнее закрытие — ТОЛЬКО единый механизм В3
+#            (_try_resolve_absent_position): первый достоверный снимок
+#            регистрирует кандидата, закрытие — после второго достоверного
+#            снимка с интервалом >= RECONCILE_CONFIRM_MIN_AGE_SECONDS;
+#         в) get_positions()=None не подтверждает и не сбрасывает
+#            подозрение (process_closing/reconcile при None учёт и
+#            кандидатов не трогают).
+#       P0-5, OrderLedger, per-order cursor, fail-closed — без ослаблений.
+#
 
 import asyncio
 import csv
@@ -331,6 +446,11 @@ _STATUS_NAME_BY_CODE = {
     1: "FILL", 2: "REJECTED", 3: "CANCELLED", 4: "NEW", 5: "PARTIALLYFILL", 6: "EXPIRED",
 }
 _TERMINAL_ORDER_STATUSES = {"FILL", "REJECTED", "CANCELLED", "EXPIRED"}
+
+# ЭТАП 5Б (§4.2): терминальные статусы записей журнала close_orders —
+# заявка с таким статусом НЕ блокирует новую SELL. Единый набор с
+# execution._TERMINAL_SELL_STATUSES (имена + сырые числовые коды).
+_SELL_JOURNAL_TERMINAL_STATUSES = {"FILL", "CANCELLED", "REJECTED", "EXPIRED", "1", "2", "3"}
 
 
 def _status_name(raw_status):
@@ -403,6 +523,145 @@ rm_ref = None
 ledger_ref = None
 state_save_failed = False
 
+
+# ============================================================
+# ЭТАП 5Б: ЯВНЫЕ ТИПЫ ИДЕНТИФИКАТОРОВ И ЗАЩИТА ОТ ПОВТОРНОЙ SELL
+# ============================================================
+
+async def _poll_ledger_order_state(client: TinkoffClient, rec: dict):
+    """ЭТАП 5Б (§5.3/§5.4): статус заявки из записи реестра с ЯВНЫМ типом
+    идентификатора.
+
+    Записи, созданные роботом (record_intent ДО отправки), имеют
+    order_request_id == order_id (клиентский UUID) — опрос строго по
+    ORDER_ID_TYPE_REQUEST. Клиентский UUID НИКОГДА не передаётся как
+    биржевой ID.
+
+    Записи без order_request_id (legacy / неизвестные заявки брокера,
+    ключенные биржевым ID) опрашиваются по-прежнему — без order_id_type,
+    чтобы не менять их поведение без подтверждения требуемого типа.
+
+    None — состояние НЕИЗВЕСТНО: вызывающий код не трактует его как отказ
+    (fail-closed, как и прежде)."""
+    oid = str(rec.get("order_id") or "")
+    if not oid:
+        return None
+    if rec.get("order_request_id"):
+        # запись робота: ключ — клиентский UUID (ORDER_ID_TYPE_REQUEST)
+        return await client.get_sandbox_order_state(oid, order_id_type="REQUEST")
+    # тип идентификатора не подтверждён — прежнее поведение (без типа)
+    return await client.get_sandbox_order_state(oid)
+
+
+def _cancel_confirmed_request_id(rec: dict) -> Optional[str]:
+    """ЭТАП 5Б (§7): клиентский UUID записи, если его тип ДОСТОВЕРНО
+    подтверждён самой записью (order_request_id == order_id — запись
+    создана роботом до отправки). Для таких записей отмена выполняется
+    строго по ORDER_ID_TYPE_REQUEST (клиентский UUID не подменяет
+    биржевой ID и наоборот).
+
+    Для записей без подтверждённого типа (legacy) возвращается None —
+    отмена выполняется В ПРЕЖНЕМ поведении (запрос без order_id_type,
+    как до разделения идентификаторов): существующее поведение не меняется
+    без подтверждения требуемого типа идентификатора."""
+    oid = str(rec.get("order_id") or "")
+    if oid and str(rec.get("order_request_id") or "") == oid:
+        return oid
+    return None
+
+
+def _sell_block_reason(pos, ledger: Optional[OrderLedger]) -> Optional[str]:
+    """ЭТАП 5Б (§4.2): причина ЗАПРЕТА новой SELL по позиции/FIGI.
+
+    Проверяет:
+      1) незавершённую SELL самой позиции (close_order_request_id /
+         close_order_id — судьба предыдущей заявки не разрешена);
+      2) незавершённые записи журнала pos.close_orders (статус не
+         терминальный);
+      3) незавершённые/неопределённые SELL-записи реестра по FIGI
+         (в т.ч. потерянный ответ после краха — INTENT без исхода).
+
+    Если причина существует — новая заявка НЕ отправляется, позиция НЕ
+    переводится в OPEN; разрешение — только терминальный результат
+    исходной заявки либо оператор."""
+    close_side = "SELL" if pos.direction == "BUY" else "BUY"
+    req_id = getattr(pos, "close_order_request_id", None)
+    if req_id:
+        return f"предыдущая SELL не разрешена (close_order_request_id={req_id})"
+    if pos.close_order_id:
+        return f"предыдущая SELL не разрешена (close_order_id={pos.close_order_id})"
+    for oid, rec in (getattr(pos, "close_orders", {}) or {}).items():
+        status = str(rec.get("status") or "").upper()
+        if status in _SELL_JOURNAL_TERMINAL_STATUSES:
+            continue
+        if rec.get("side") not in (None, close_side):
+            continue
+        return f"журнал close_orders: заявка {oid} в нетерминальном статусе {status or 'UNKNOWN'}"
+    if ledger is not None and ledger.figi_has_open_order(pos.figi, close_side):
+        return "в реестре заявок есть незавершённая/неопределённая SELL по FIGI"
+    return None
+
+
+def _link_broker_order_to_position(monitor, request_id: str,
+                                   exchange_id: Optional[str], rec: dict) -> bool:
+    """ЭТАП 5Б (§5.4): однозначная привязка активной заявки брокера к
+    локальной позиции по совпадению КЛИЕНТСКОГО UUID (order_request_id)
+    с записью реестра.
+
+    Правила постановки:
+      - связь по FIGI И trade_id записи (не только по FIGI и времени);
+      - несколько кандидатов — не выбирать произвольно: привязки нет;
+      - конфликт request_id — не привязывать (неоднозначность);
+      - восстанавливаются ОБЕ ссылки: close_order_request_id (клиентский
+        UUID) и close_order_id (настоящий биржевой ID из OrderState.order_id).
+
+    Возвращает True, если связь восстановлена."""
+    figi = rec.get("figi") or ""
+    close_side = "SELL" if rec.get("side") == "SELL" else "BUY"
+    candidates = [p for p in monitor.positions.values()
+                  if p.figi == figi and p.state in ACTIVE_STATES
+                  and (("SELL" if p.direction == "BUY" else "BUY") == close_side)]
+    if not candidates:
+        return False
+    trade_id = str(rec.get("trade_id") or "")
+    if trade_id:
+        matching = [p for p in candidates if str(p.trade_id or "") == trade_id]
+    else:
+        matching = [p for p in candidates if not getattr(p, "close_order_request_id", None)]
+    if len(matching) != 1:
+        # неоднозначное сопоставление — привязки нет, позиция остаётся
+        # как есть (UNCERTAIN), автоматический выбор запрещён
+        return False
+    pos = matching[0]
+    current_req = getattr(pos, "close_order_request_id", None)
+    if current_req and current_req != request_id:
+        logging.error(
+            f"[startup] {pos.ticker}: конфликт close_order_request_id "
+            f"(позиция={current_req}, брокер={request_id}) — привязка НЕ выполнена"
+        )
+        return False
+    # конфликт БИРЖЕВЫХ ID: request_id совпал, но в позиции уже сохранён
+    # другой биржевой ID заявки. Два разных exchange ID при одном и том же
+    # клиентском UUID — неоднозначность (одна SELL не может иметь два
+    # биржевых ID): привязка НЕ выполняется, оба ID позиции не изменяются,
+    # разрешение — вручную/по терминальному результату исходной заявки.
+    # Проверка ДО любых изменений позиции; пустой close_order_id или
+    # отсутствующий exchange_id конфликтом не считаются.
+    if (current_req == request_id and pos.close_order_id
+            and exchange_id and pos.close_order_id != exchange_id):
+        logging.error(
+            f"[startup] {pos.ticker}: конфликт биржевого ID заявки "
+            f"(request_uuid={request_id}, "
+            f"позиция close_order_id={pos.close_order_id}, "
+            f"брокер exchange_id={exchange_id}) — привязка НЕ выполнена"
+        )
+        return False
+    if not current_req:
+        pos.close_order_request_id = request_id
+    if exchange_id and not pos.close_order_id:
+        pos.close_order_id = exchange_id
+    return True
+
 # Партия P0-5: UTC-момент последней УСПЕШНОЙ сверки reconcile() (достоверный
 # снимок портфеля, без расхождений) — маркер «подтверждённого безопасного
 # разрешения» неопределённостей реестра, появившихся до этого момента.
@@ -413,6 +672,11 @@ _last_reconcile_confirmed_utc = None
 
 _strategy_event_keys = set()
 _promote_throttle = {"n": 0, "alive": 0}
+
+# Пакет В3: кандидаты на внешнее закрытие (figi -> UTC-время первого
+# обнаружения). НЕ персистится намеренно: после рестарта двойное
+# подтверждение начинается заново (два последовательных достоверных снимка).
+_external_close_candidates = {}
 
 
 def is_trading_enabled() -> bool:
@@ -643,6 +907,72 @@ def _log_strategy_diagnostic(
 
 
 # ============================================================
+# С1: СВЕЧНЫЕ ЭКСТРЕМУМЫ И ATR ДЛЯ БЕЗУБЫТКА/ТРЕЙЛИНГА
+# (используются ТОЛЬКО при config.BE_TRAIL_ENABLED=True;
+#  в базовой поставке выключено — ноль доп. вызовов API)
+# ============================================================
+
+def _parse_iso_ts(value):
+    """ISO-строка -> datetime (UTC-aware) или None."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _atr_from_df(df: pd.DataFrame, period: int):
+    """ATR(period) по 5-минутным свечам (среднее True Range за period)."""
+    try:
+        if df is None or df.empty or not {"high", "low", "close"}.issubset(df.columns):
+            return None
+        high = df["high"].astype(float)
+        low = df["low"].astype(float)
+        close = df["close"].astype(float)
+        prev_close = close.shift(1)
+        tr = pd.concat(
+            [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
+            axis=1,
+        ).max(axis=1).dropna()
+        if period <= 0 or len(tr) < period:
+            return None
+        value = float(tr.tail(period).mean())
+        return value if value > 0 else None
+    except Exception as e:
+        logging.warning(f"[stage1] ATR не рассчитан: {type(e).__name__}: {e}")
+        return None
+
+
+async def _fetch_extremes_and_atrs(client: TinkoffClient, figis):
+    """Свечные экстремумы (high/low последней 5-мин свечи — кумулятивны
+    внутри бара, поэтому поллинг 30 с их не пропускает) и ATR по OPEN-позициям."""
+    extremes, atrs = {}, {}
+    for figi in figis:
+        try:
+            df = await _build_candles_df(client, figi)
+        except Exception as e:
+            logging.warning(f"[stage1] свечи {figi}: {type(e).__name__}: {e}")
+            continue
+        if df is None or df.empty:
+            continue
+        last = df.iloc[-1]
+        try:
+            hi, lo = float(last["high"]), float(last["low"])
+            if hi > 0 and lo > 0:
+                extremes[figi] = (hi, lo)
+        except (KeyError, TypeError, ValueError):
+            pass
+        atr = _atr_from_df(df, config.TRAIL_ATR_PERIOD)
+        if atr:
+            atrs[figi] = atr
+    return extremes, atrs
+
+
+# ============================================================
 # PERSISTENCE (state.json)
 # ============================================================
 
@@ -723,6 +1053,356 @@ def _load_state(monitor: ExecutionMonitor, rm: RiskManager) -> bool:
 
 
 # ============================================================
+# ПАКЕТ В2/В3: САМОВОССТАНОВЛЕНИЕ УЧЁТА ПРИ ОТСУТСТВИИ ПОЗИЦИИ У БРОКЕРА
+# ============================================================
+
+def _ledger_last_buy_time(ledger: Optional[OrderLedger], figi: str):
+    """Время последней исполненной BUY-заявки по FIGI (нижняя граница для
+    «своя SELL-закрытие постфактум входа»)."""
+    if ledger is None:
+        return None
+    latest = None
+    for rec in ledger.latest_all().values():
+        if rec.get("side") != "BUY" or rec.get("figi") != figi:
+            continue
+        try:
+            executed = int(rec.get("executed_lots") or 0)
+        except (TypeError, ValueError):
+            executed = 0
+        if executed <= 0:
+            continue
+        for key in ("updated_at_utc", "created_at_utc", "timestamp_utc"):
+            dt = _parse_iso_ts(rec.get(key))
+            if dt and (latest is None or dt > latest):
+                latest = dt
+    return latest
+
+
+def _match_own_close_sell(ledger: Optional[OrderLedger], pos) -> list:
+    """Пакет В2: кандидаты «своя SELL-заявка закрытия» для позиции (лучшие
+    первыми). Доказательства принадлежности роботу (по убыванию силы):
+      1) ссылка на заявку закрытия в самой позиции — ЭТАП 5Б:
+         close_order_request_id (клиентский UUID, ключ реестра) имеет
+         приоритет; legacy-поле close_order_id проверяется следом;
+         запись реестра при наличии — берётся из неё;
+      2) запись реестра: обратная сторона, тот же FIGI, requested_lots > 0,
+         создана ПОСЛЕ входа позиции (order_send_time/signal_time, а для
+         позиций без них — после последней исполненной BUY по FIGI).
+    Возвращает список записей реестра (или одну синтезированную для случая
+    ссылки без записи — старый формат state.json)."""
+    close_side = "SELL" if pos.direction == "BUY" else "BUY"
+    # 1) Прямое доказательство — активная заявка закрытия в позиции.
+    #    ЭТАП 5Б: ключ реестра — клиентский UUID (close_order_request_id);
+    #    close_order_id для legacy-позиций исторически содержит тот же UUID.
+    own_oid = str(getattr(pos, "close_order_request_id", None) or pos.close_order_id or "")
+    if own_oid:
+        oid = own_oid
+        rec = ledger.latest(oid) if ledger is not None else None
+        if rec is not None and rec.get("side") == close_side and rec.get("figi") == pos.figi:
+            return [rec]
+        # Записи в реестре нет (старый формат state.json): поле позиции —
+        # доказательство принадлежности по построению. Статус/исполнение
+        # уточняются у брокера в _try_resolve_absent_position.
+        return [{
+            "order_id": oid, "figi": pos.figi, "side": close_side,
+            "requested_lots": int(pos.close_requested_lots or pos.quantity or 0),
+            "executed_lots": int(pos.close_applied_lots or 0),
+            "avg_exec_price": None, "status": "UNKNOWN",
+            "reason": f"close:{pos.close_reason or ''}",
+            "created_at_utc": pos.close_requested_at,
+            "updated_at_utc": pos.close_requested_at,
+        }]
+    # 2) Поиск в реестре — для краха между отправкой SELL и сохранением
+    #    state.json (close_order_id не успел попасть в state).
+    if ledger is None:
+        return []
+    entry_floor = (_parse_iso_ts(pos.order_send_time)
+                   or _parse_iso_ts(pos.signal_time)
+                   or _ledger_last_buy_time(ledger, pos.figi))
+    if entry_floor is None:
+        return []
+    candidates = []
+    for rec in ledger.latest_all().values():
+        if rec.get("side") != close_side or rec.get("figi") != pos.figi:
+            continue
+        try:
+            requested = int(rec.get("requested_lots") or 0)
+            executed = int(rec.get("executed_lots") or 0)
+        except (TypeError, ValueError):
+            continue
+        if requested <= 0:
+            continue
+        rec_dt = (_parse_iso_ts(rec.get("created_at_utc"))
+                  or _parse_iso_ts(rec.get("timestamp_utc")))
+        if rec_dt is None or rec_dt <= entry_floor:
+            continue  # заявка старее входа — относится к предыдущей сделке
+        full = requested > 0 and executed >= requested
+        candidates.append((
+            (1 if full else 0, 1 if executed > 0 else 0, rec_dt.timestamp()),
+            rec,
+        ))
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return [rec for _, rec in candidates]
+
+
+def _finalize_position_closed(pos, *, sold_lots: int, exit_price,
+                              close_reason: str, order_id: str,
+                              requested_at: str, note: str,
+                              price_confirmed: bool = False):
+    """Пакет В2/В3: единая точка закрытия учёта позиции, когда брокерская
+    заявка не может быть обработана штатно (позиция уже отсутствует у
+    брокера). CSV-строка будет записана штатным process_closing (logged=False);
+    note попадает в error_note CSV (динамический атрибут, не персистится).
+
+    v2.3.1-stage1 (ТЗ-5): price_confirmed=True ТОЛЬКО когда exit_price взят
+    из реального исполненного ордера этой позиции (В2: отчёт брокера/реестр).
+    Для В3 (приблизительная рыночная цена на момент обнаружения)
+    price_confirmed=False — CSV-строка будет без P&L (запрет фиктивного P&L)."""
+    sold = max(1, int(sold_lots))
+    price = None
+    try:
+        p = float(exit_price) if exit_price is not None else None
+        price = p if (p is not None and p > 0) else None
+    except (TypeError, ValueError):
+        price = None
+    pos.quantity = 0
+    pos.executed_lots = sold
+    pos.execution_price = price
+    # v2.3.1-stage1 (ТЗ-5): маркер подтверждённой цены выхода.
+    pos.exit_price_confirmed = bool(price_confirmed) and price is not None
+    pos.close_reason = close_reason
+    pos.close_order_id = None
+    # ЭТАП 5Б: order_id из реестра — КЛИЕНТСКИЙ UUID; сохраняется в
+    # close_order_request_id (биржевой ID при В2/В3-закрытии неизвестен —
+    # close_order_id остаётся пустым, фиктивные ID не создаются).
+    pos.close_order_request_id = order_id or None
+    pos.close_requested_lots = sold
+    pos.close_requested_at = requested_at or datetime.now(timezone.utc).isoformat()
+    pos.close_price_before_order = price if price is not None else 0.0
+    pos.partial = False
+    pos.logged = False
+    pos.state = PositionState.CLOSED
+    pos.error_note = note or ""
+    return pos
+
+
+async def _try_resolve_absent_position(client: TinkoffClient,
+                                       ledger: Optional[OrderLedger], pos) -> str:
+    """Пакет В2/В3 для ветки reconcile «активная позиция локально,
+    у брокера отсутствует» (достоверный снимок).
+
+    Возвращает:
+      "ledger_close"   — учёт закрыт по СВОЕЙ SELL-заявке (В2);
+      "external_close" — учёт закрыт как внешнее (ручное) закрытие после
+                         двойного подтверждения (В3);
+      "candidate"      — первое обнаружение: учёт НЕ менялся, подтверждение
+                         — на следующей сверке;
+      "uncertain"      — v2.3.2-stage1 (Дефект-1): своя SELL-заявка закрытия
+                         существует, но её статус НЕТЕРМИНАЛЬНЫЙ
+                         (NEW/PARTIALLYFILL/неизвестен) — окончательное
+                         исполнение не доказано, учёт НЕ закрывается;
+      "mismatch"       — разрешить не удалось: прежнее поведение
+                         (RECONCILE_MISMATCH + блокировка новых входов).
+    """
+    ticker = pos.ticker
+    # --- В2: своя SELL-заявка закрытия ---
+    for rec in _match_own_close_sell(ledger, pos):
+        oid = str(rec.get("order_id") or "")
+        if not oid:
+            continue
+        try:
+            executed = int(rec.get("executed_lots") or 0)
+            requested = int(rec.get("requested_lots") or 0)
+        except (TypeError, ValueError):
+            executed, requested = 0, 0
+        status = rec.get("status")
+        price = None
+        rec_price = rec.get("avg_exec_price")
+        if rec_price is not None:
+            try:
+                p = float(rec_price)
+                price = p if p > 0 else None
+            except (TypeError, ValueError):
+                price = None
+        # Уточняем статус/исполнение/цену у брокера, если запись неполная.
+        # ЭТАП 5Б (§5.3): опрос с ЯВНЫМ типом идентификатора записи реестра.
+        if executed <= 0 or status not in _TERMINAL_ORDER_STATUSES or price is None:
+            state = await _poll_ledger_order_state(client, rec)
+            if state is not None:
+                status = _status_name(getattr(state, "execution_report_status", None)) or status
+                broker_le = int(getattr(state, "lots_executed", 0) or 0)
+                if broker_le > 0:
+                    executed = broker_le
+                info = await client.get_instrument_info(pos.figi)
+                lot = int(info.get("lot")) if info and info.get("lot") else (pos.lot_size or 1)
+                p = ExecutionMonitor._extract_price(state, executed, lot)
+                if p:
+                    price = p
+        if executed <= 0:
+            continue  # эта заявка не доказывает исполнение — следующий кандидат
+        # v2.3.2-stage1 (Дефект-1: нетерминальная SELL-заявка). После
+        # уточнения у брокера статус может остаться НЕТЕРМИНАЛЬНЫМ
+        # (NEW / PARTIALLYFILL / UNCERTAIN / UNKNOWN / None) — в том числе
+        # при executed_lots > 0 (частичное исполнение живой заявки, кейс
+        # «SELL 10 лот., исполнено 3, статус PARTIALLYFILL»). Исполнение
+        # такой заявки НЕ окончательно: возможны дополнительные лоты,
+        # отмена или отказ брокера. Раньше учёт закрывался сразу
+        # (LEDGER_CLOSE по частично исполненной живой SELL) — дефект.
+        # Теперь:
+        #   - локальный учёт НЕ закрывается (никакого финального закрытия
+        #     по нетерминальному статусу);
+        #   - повторная отправка SELL не выполняется (заявка уже зарегистрирована;
+        #     SL/TP для UNCERTAIN не действуют — новых close-заявок нет);
+        #   - позиция переводится в UNCERTAIN, новые входы блокируются
+        #     (mismatch-путь в reconcile);
+        #   - разрешение — ТОЛЬКО терминальный отчёт этой SELL-заявки:
+        #     следующий вызов В2 закроет учёт с подтверждённой ценой
+        #     (FILL/CANCELLED/EXPIRED с executed_lots>0) или вернёт позицию
+        #     в штатное русло (REJECTED/CANCELLED без исполнения -> В3).
+        if status not in _TERMINAL_ORDER_STATUSES:
+            pos.state = PositionState.UNCERTAIN
+            client.uncertain_state = True
+            logging.error(
+                f"[reconcile] {ticker}: SELL-заявка закрытия {oid} НЕТЕРМИНАЛЬНА "
+                f"(status={status}, executed={executed}/{requested}), позиция "
+                f"отсутствует у брокера — окончательное исполнение не доказано: "
+                f"учёт НЕ закрыт, позиция UNCERTAIN, повторная SELL запрещена"
+            )
+            research_logger.log_event("SELL_NON_TERMINAL_CLOSE_BLOCKED", {
+                "figi": pos.figi, "ticker": ticker, "order_id": oid,
+                "status": status, "executed_lots": executed,
+                "requested_lots": requested, "quantity": pos.quantity,
+            })
+            await notify(
+                f"⚠️ <b>{ticker}</b>: позиция отсутствует у брокера, но SELL-заявка "
+                f"закрытия ещё НЕ завершена ({status}, исполнено {executed}/{requested}).\n"
+                f"Окончательное исполнение не доказано — учёт НЕ закрыт (UNCERTAIN), "
+                f"новые входы заблокированы до терминального статуса заявки."
+            )
+            return "uncertain"
+        sold = min(executed, int(pos.quantity) or executed)
+        full = requested > 0 and executed >= requested
+        reason_text = str(rec.get("reason") or "")
+        close_reason = "LEDGER_CLOSE"
+        if reason_text.startswith("close:"):
+            close_reason = reason_text[len("close:"):].split()[0].upper() or close_reason
+        note = "POSITION_CLOSED_BY_LEDGER"
+        if not full:
+            note += "; частичное исполнение SELL, остаток закрыт вне робота"
+        if price is None:
+            note += "; цена исполнения не получена — CSV без P&L (PRICE_UNKNOWN)"
+        _finalize_position_closed(
+            pos, sold_lots=sold, exit_price=price, close_reason=close_reason,
+            order_id=oid,
+            requested_at=rec.get("updated_at_utc") or rec.get("timestamp_utc"),
+            note=note,
+            # v2.3.1-stage1 (ТЗ-5): цена — из отчёта РЕАЛЬНОГО исполненного
+            # SELL-ордера (реестр/брокер) — подтверждённая. Если цену получить
+            # не удалось, маркер выставится False внутри _finalize_position_closed.
+            price_confirmed=True,
+        )
+        logging.warning(
+            f"[reconcile] {ticker}: позиция отсутствует у брокера, найдена своя "
+            f"SELL-заявка {oid} ({executed} лот., price={price}) — учёт закрыт "
+            f"({close_reason}), CSV-строка будет записана"
+        )
+        research_logger.log_event("POSITION_CLOSED_BY_LEDGER", {
+            "figi": pos.figi, "ticker": ticker, "order_id": oid,
+            "executed_lots": executed, "requested_lots": requested,
+            "exit_price": price, "close_reason": close_reason,
+            "ledger_status": status,
+        })
+        await notify(
+            f"ℹ️ <b>{ticker}</b>: позиция закрыта (подтверждено реестром заявок)\n"
+            f"SELL {oid}: {executed} лот. по {price if price else '—'}\n"
+            f"Причина: {close_reason}. Учёт закрыт, CSV будет записан."
+            + ("" if price else "\nЦена исполнения не получена — CSV-строка без P&L.")
+        )
+        return "ledger_close"
+
+    # --- В3: внешнее (ручное) закрытие — двойное подтверждение ---
+    first_seen = _external_close_candidates.get(pos.figi)
+    if first_seen is None:
+        _external_close_candidates[pos.figi] = datetime.now(timezone.utc).isoformat()
+        logging.warning(
+            f"[reconcile] {ticker}: позиция {pos.quantity} лот. отсутствует у брокера, "
+            f"своя SELL-заявка в реестре не найдена — подозрение на внешнее "
+            f"закрытие; учёт не менялся, подтверждение на следующей сверке"
+        )
+        research_logger.log_event("POSITION_EXTERNAL_CLOSE_SUSPECTED", {
+            "figi": pos.figi, "ticker": ticker, "quantity": pos.quantity,
+        })
+        return "candidate"
+
+    # v2.3.1-stage1 (ТЗ-3): двойное подтверждение — снимки должны быть
+    # разнесены минимум на RECONCILE_CONFIRM_MIN_AGE_SECONDS (по умолчанию
+    # один торговый цикл). Это исключает подтверждение двумя reconcile в
+    # ОДНОМ цикле (process_closing + шаг 4). Недостоверный снимок (None)
+    # сюда не доходит вообще: reconcile при None выходит раньше, кандидатов
+    # не трогает и подтверждением не является.
+    min_age = float(getattr(config, "RECONCILE_CONFIRM_MIN_AGE_SECONDS",
+                            config.TRADING_CYCLE_SECONDS))
+    age_ok = False
+    try:
+        first_dt = datetime.fromisoformat(str(first_seen))
+        age = (datetime.now(timezone.utc) - first_dt).total_seconds()
+        age_ok = age >= min_age
+    except (TypeError, ValueError):
+        age_ok = False  # неразборчивая метка подтверждением не является (консервативно)
+    if not age_ok:
+        logging.info(
+            f"[reconcile] {ticker}: внешнее закрытие ожидает подтверждения "
+            f"(первое обнаружение {first_seen}, разнос снимков < "
+            f"{min_age:.0f} с)"
+        )
+        return "candidate"
+
+    prices = await client.get_last_prices([pos.figi])
+    current = prices.get(pos.figi) if isinstance(prices, dict) else None
+    exit_price = None
+    if current is not None:
+        try:
+            p = float(current)
+            exit_price = p if p > 0 else None
+        except (TypeError, ValueError):
+            exit_price = None
+    if exit_price is None:
+        exit_price = pos.close_price_before_order or pos.price_before_order or 0.0
+    sold = int(pos.quantity)
+    # v2.3.1-stage1 (ТЗ-5): цена В3 — ПРИБЛИЗИТЕЛЬНАЯ рыночная цена на момент
+    # обнаружения, а НЕ цена исполнения ручной продажи (она неизвестна).
+    # price_confirmed=False -> CSV-строка без P&L (запрет фиктивного P&L);
+    # приблизительная цена сохраняется в error_note и событии.
+    approx_note_price = f"~{exit_price}" if exit_price else "неизвестна"
+    _finalize_position_closed(
+        pos, sold_lots=sold, exit_price=exit_price, close_reason="EXTERNAL_CLOSE",
+        order_id=None, requested_at=datetime.now(timezone.utc).isoformat(),
+        note=("EXTERNAL_CLOSE: позиция продана вне робота; цена выхода "
+              f"приблизительная ({approx_note_price}), вход учтён штатно; "
+              "P&L не рассчитан — цена исполнения неизвестна"),
+        price_confirmed=False,
+    )
+    _external_close_candidates.pop(pos.figi, None)
+    logging.warning(
+        f"[reconcile] {ticker}: внешнее закрытие подтверждено повторной сверкой — "
+        f"учёт закрыт (EXTERNAL_CLOSE, {sold} лот., цена~{exit_price}, P&L не рассчитан)"
+    )
+    research_logger.log_event("POSITION_CLOSED_EXTERNAL", {
+        "figi": pos.figi, "ticker": ticker, "quantity": sold,
+        "approx_exit_price": exit_price, "first_seen_utc": first_seen,
+        "pnl_recorded": False,
+        "reason": "цена исполнения неизвестна — P&L не рассчитан (ТЗ-5)",
+    })
+    await notify(
+        f"ℹ️ <b>{ticker}</b>: позиция продана вне робота (подтверждено дважды)\n"
+        f"Учёт закрыт: {sold} лот., цена выхода ~{exit_price or '—'}\n"
+        f"CSV-строка будет записана с пометкой EXTERNAL_CLOSE, БЕЗ P&L "
+        f"(цена исполнения неизвестна)."
+    )
+    return "external_close"
+
+
+# ============================================================
 # RECONCILE (двусторонний)
 # ============================================================
 
@@ -766,8 +1446,25 @@ async def reconcile(client: TinkoffClient, monitor: ExecutionMonitor,
 
     mismatches = []
     mutated = False  # этап 5: изменения учёта сразу сохраняются (D6)
+    pending_external = False  # пакет В3: кандидаты на внешнее закрытие в этой сверке
 
     for figi, pdata in broker.items():
+        # v2.3.1-stage1 (ТЗ-3): позиция снова видна у брокера — любое прежнее
+        # подозрение на её внешнее закрытие снято. Без этой очистки
+        # «протухший» first_seen дал бы МГНОВЕННОЕ подтверждение при
+        # будущем исчезновении позиции по ОДНОМУ снимку — двойное
+        # подтверждение потеряло бы смысл.
+        if figi in _external_close_candidates:
+            _external_close_candidates.pop(figi, None)
+            _cleared_pos = local.get(figi)
+            logging.info(
+                f"[reconcile] {_cleared_pos.ticker if _cleared_pos else figi}: "
+                f"позиция снова у брокера — подозрение на внешнее закрытие снято"
+            )
+            research_logger.log_event("EXTERNAL_CLOSE_SUSPECT_CLEARED", {
+                "figi": figi,
+                "ticker": _cleared_pos.ticker if _cleared_pos else figi,
+            })
         pos = local.get(figi)
         if pos is None:
             # Этап 5 (D2): адопция — позиция брокера без локального учёта.
@@ -839,6 +1536,35 @@ async def reconcile(client: TinkoffClient, monitor: ExecutionMonitor,
                 f"ℹ️ <b>{pos.ticker}</b>: RECOVERY-позиция отсутствует у брокера — учёт закрыт."
             )
             continue
+        # Пакет В2/В3: позиция активна локально, но отсутствует у брокера
+        # (достоверный снимок). Сначала пробуем разрешить по реестру заявок
+        # или двойному подтверждению — и только если не удалось, фиксируем
+        # расхождение (прежнее поведение).
+        action = await _try_resolve_absent_position(client, ledger, pos)
+        if action in ("ledger_close", "external_close"):
+            mutated = True
+            continue
+        if action == "uncertain":
+            # v2.3.2-stage1 (Дефект-1): своя SELL-заявка закрытия в
+            # НЕТЕРМИНАЛЬНОМ статусе (NEW/PARTIALLYFILL/неизвестен) при
+            # отсутствующей у брокера позиции. Учёт НЕ закрыт (позиция
+            # оставлена в UNCERTAIN внутри _try_resolve_absent_position),
+            # повторная отправка SELL не выполнялась. Фиксируем расхождение:
+            # client.uncertain_state=True + reconcile_done=False — новые
+            # входы блокированы до терминального статуса заявки.
+            mismatches.append(
+                f"{figi}: SELL-заявка закрытия в нетерминальном статусе, "
+                f"позиция отсутствует у брокера — учёт не закрывается "
+                f"(ожидание терминального отчёта)"
+            )
+            continue
+        if action == "candidate":
+            # первое обнаружение внешнего закрытия: учёт не менялся;
+            # повторная сверка на следующем цикле (флаг ниже), расхождение
+            # не фиксируется — входы по FIGI и так заблокированы локальной
+            # активной позицией
+            pending_external = True
+            continue
         mismatches.append(f"{figi}: есть локально ({pos.quantity}), нет у брокера")
 
     if mutated and rm is not None:
@@ -853,6 +1579,17 @@ async def reconcile(client: TinkoffClient, monitor: ExecutionMonitor,
         logging.error(f"[reconcile] {msg}")
         research_logger.log_event("RECONCILE_MISMATCH", {"mismatches": mismatches})
         await notify(msg)
+        return
+
+    if pending_external:
+        # Пакет В3: первое обнаружение внешнего закрытия требует повторного
+        # подтверждения. Сверка НЕ считается завершённой (маркер успеха
+        # не выставляется), повторный reconcile — на следующем цикле.
+        client.uncertain_state = True
+        reconcile_done = False
+        logging.warning(
+            "[reconcile] есть кандидаты на внешнее закрытие — повторная сверка на следующем цикле"
+        )
         return
 
     if not local and not broker:
@@ -881,13 +1618,38 @@ async def close_position(client: TinkoffClient, pos, price: float):
         else OrderDirection.ORDER_DIRECTION_BUY
     )
 
+    # ЭТАП 5Б (§4.2): ЗАЩИТА ОТ ПОВТОРНОЙ SELL. Если судьба предыдущей
+    # SELL по этой позиции/FIGI неизвестна (потерянный ответ брокера,
+    # незавершённый журнал, неопределённая запись реестра) — новая
+    # заявка НЕ отправляется, позиция НЕ переводится в OPEN. Разрешение —
+    # только терминальный результат исходной заявки либо оператор.
+    block_reason = _sell_block_reason(pos, ledger_ref)
+    if block_reason:
+        logging.error(
+            f"[close] {pos.ticker}: повторная SELL ЗАПРЕЩЕНА ({block_reason}) — "
+            f"заявка не отправляется (fail-closed)"
+        )
+        research_logger.log_event("SELL_DUPLICATE_BLOCKED", {
+            "trade_id": pos.trade_id, "ticker": pos.ticker, "figi": pos.figi,
+            "close_order_request_id": getattr(pos, "close_order_request_id", None),
+            "close_order_id": pos.close_order_id,
+            "reason": block_reason,
+        })
+        if pos.state == PositionState.OPEN:
+            # SL/TP успел пометить позицию для закрытия в этом же цикле:
+            # пока исходная SELL не разрешена, OPEN невозможен.
+            pos.state = PositionState.UNCERTAIN
+            client.uncertain_state = True
+        return
+
     # Этап 5: SELL-заявки тоже проходят через реестр (INTENT до сетевого вызова).
+    # ЭТАП 5Б (§4.1): клиентский UUID известен ДО сетевого вызова.
     # При ошибке записи закрытие откладывается: позиция остаётся CLOSING ->
     # resolve_closing -> UNCERTAIN -> сверка вернёт её в OPEN и SL/TP повторятся.
-    close_order_id = str(uuid.uuid4())
+    close_order_request_id = str(uuid.uuid4())
     if ledger_ref is not None:
         intent_ok = ledger_ref.record_intent(
-            close_order_id, trade_id=pos.trade_id, figi=pos.figi,
+            close_order_request_id, trade_id=pos.trade_id, figi=pos.figi,
             ticker=pos.ticker, side="SELL", requested_lots=pos.quantity,
             reason=f"close:{pos.close_reason}",
         )
@@ -897,72 +1659,166 @@ async def close_position(client: TinkoffClient, pos, price: float):
             )
             return
 
-    result = await client.post_market_order(pos.figi, pos.quantity, direction, order_id=close_order_id)
+    # ЭТАП 5Б (§4.1): намерение SELL сохраняется В ПОЗИЦИИ до отправки —
+    # клиентский UUID не потеряется даже при крахе между отправкой и
+    # получением ответа. Биржевой ID (close_order_id) пока неизвестен и
+    # НЕ заполняется клиентским UUID.
+    pos.close_order_request_id = close_order_request_id
+    monitor = monitor_ref
+    if monitor is not None:
+        try:
+            monitor.add_close_order(
+                pos, close_order_request_id, pos.quantity,
+                datetime.now(timezone.utc).isoformat(),
+            )
+        except ValueError as exc:
+            logging.error(
+                f"[close] {pos.ticker}: намерение SELL не зарегистрировано в "
+                f"журнале позиции ({exc}) — заявка НЕ отправляется (fail-closed)"
+            )
+            if ledger_ref is not None:
+                ledger_ref.record_uncertain(
+                    close_order_request_id, trade_id=pos.trade_id, figi=pos.figi,
+                    ticker=pos.ticker, side="SELL", requested_lots=pos.quantity,
+                    reason="журнал позиции не принял намерение — отправка отменена",
+                    source="close_position",
+                )
+            pos.state = PositionState.UNCERTAIN
+            client.uncertain_state = True
+            return
+
+    result = await client.post_market_order(pos.figi, pos.quantity, direction, order_id=close_order_request_id)
+    # ЭТАП 5Б (§5.2): биржевой ID — ТОЛЬКО настоящий ID из ответа брокера.
+    # При потере ответа он неизвестен и НЕ подменяется клиентским UUID.
+    exchange_order_id = getattr(result, "exchange_order_id", None)
 
     if result.state is None:
         pos.state = PositionState.UNCERTAIN
         client.uncertain_state = True
+        # close_order_request_id УЖЕ сохранён в позиции до отправки;
+        # close_order_id остаётся пустым (биржевой ID неизвестен).
         if ledger_ref is not None:
             ledger_ref.record_uncertain(
-                close_order_id, trade_id=pos.trade_id, figi=pos.figi, ticker=pos.ticker,
+                close_order_request_id, trade_id=pos.trade_id, figi=pos.figi, ticker=pos.ticker,
                 side="SELL", requested_lots=pos.quantity,
                 reason="post: ответ потерян — закрытие могло быть принято", source="close_position",
                 error=str(result.error) if result.error else None,
             )
         logging.error(
-            f"[close] {pos.ticker}: state=None (order_id={result.order_id}) — UNCERTAIN. "
-            f"Повторная отправка запрещена."
+            f"[close] {pos.ticker}: state=None (order_request_id={close_order_request_id}) — "
+            f"UNCERTAIN. Повторная отправка запрещена."
         )
         research_logger.log_event("CLOSE_FAILED", {
             "trade_id": pos.trade_id, "ticker": pos.ticker, "figi": pos.figi,
-            "order_id": result.order_id,
+            "order_request_id": close_order_request_id,
+            "order_id": close_order_request_id,
+            "exchange_order_id": None,
         })
         return
 
     if ledger_ref is not None:
         ledger_ref.record_sent(
-            close_order_id, trade_id=pos.trade_id, figi=pos.figi, ticker=pos.ticker,
+            close_order_request_id, trade_id=pos.trade_id, figi=pos.figi, ticker=pos.ticker,
             side="SELL", requested_lots=pos.quantity,
             executed_lots=int(getattr(result.state, "lots_executed", 0) or 0),
             status_hint=_status_name(getattr(result.state, "execution_report_status", None)),
             source="post_response",
+            exchange_order_id=str(exchange_order_id) if exchange_order_id else None,
         )
 
-    pos.close_order_id = result.order_id
+    # Биржевой ID сохраняется ТОЛЬКО если брокер его вернул; иначе поле
+    # остаётся пустым до получения настоящего биржевого ID (§6 миграции).
+    pos.close_order_id = str(exchange_order_id) if exchange_order_id else None
     pos.close_requested_lots = pos.quantity
     pos.close_requested_at = datetime.now(timezone.utc).isoformat()
     logging.info(
         f"🔒 [CLOSE] {pos.ticker} {pos.close_reason} @ {price:.4f} → CLOSING "
-        f"(id={result.order_id}, requested={pos.close_requested_lots})"
+        f"(request_id={close_order_request_id}, exchange_id={exchange_order_id or '—'}, "
+        f"requested={pos.close_requested_lots})"
     )
     research_logger.log_event("CLOSE_SENT", {
         "trade_id": pos.trade_id,
         "ticker": pos.ticker, "figi": pos.figi, "reason": pos.close_reason,
-        "order_id": result.order_id, "price_before_order": price,
+        "order_request_id": close_order_request_id,
+        "order_id": close_order_request_id,
+        "exchange_order_id": str(exchange_order_id) if exchange_order_id else None,
+        "price_before_order": price,
         "requested_lots": pos.close_requested_lots,
     })
 
 
-async def process_closing(client: TinkoffClient, monitor: ExecutionMonitor):
+async def process_closing(client: TinkoffClient, monitor: ExecutionMonitor, rm: Optional[RiskManager] = None):
     global reconcile_done
 
     for pos in list(monitor.positions.values()):
         if pos.state == PositionState.CLOSING:
-            await monitor.resolve_closing(pos)
+            # ЭТАП 5Б: ledger передаётся для синхронизации статуса SELL-записи
+            # реестра с отчётом брокера (FIGI-блокировка снимается терминалом).
+            await monitor.resolve_closing(pos, ledger=ledger_ref)
+
+    # v2.3.1-stage1 (ТЗ-4/5): UNCERTAIN-позиция с СВОЕЙ close-заявкой получает
+    # шанс разрешиться по ОТЧЁТУ ЗАЯВКИ ДО сверки портфеля. Если SELL исполнился
+    # (в т.ч. пока робот был офлайн / ответ post был потерян),
+    # apply_close_execution закроет учёт с РЕАЛЬНОЙ ценой исполнения и
+    # корректным P&L — вместо закрытия с неизвестной ценой в resolve_uncertain.
+    # Для UNCERTAIN без close-заявок (BUY-неопределённость) ничего не меняется.
+    # ЭТАП 5Б (§4.1): опросятся ОБЕ ссылки — close_order_id (биржевой ID) И
+    # close_order_request_id (клиентский UUID, сохранённый при ПОТЕРЯННОМ
+    # ответе брокера). Потерянная SELL больше не «невидима» для опроса.
+    # resolve_closing идемпотентен (per-order cursor, защита от повторного
+    # применения лотов — прежняя), противоречия fail-closed в UNCERTAIN.
+    for pos in list(monitor.positions.values()):
+        if (pos.state == PositionState.UNCERTAIN
+                and (pos.close_order_id or getattr(pos, "close_order_request_id", None))):
+            await monitor.resolve_closing(pos, ledger=ledger_ref)
 
     uncertain_positions = [p for p in monitor.positions.values() if p.state == PositionState.UNCERTAIN]
     if uncertain_positions:
         positions = await client.get_positions()
         if positions is None:
+            # v2.3.2-stage1 (Дефект-2): недостоверный снимок НИ подтверждает,
+            # НИ сбрасывает подозрение на внешнее закрытие: resolve_uncertain
+            # не вызывается, кандидаты В3 (_external_close_candidates) не
+            # трогаются, счётчик интервала двойного подтверждения не
+            # перезапускается. Учёт не меняется.
             logging.error("[process_closing] get_positions()=None — UNCERTAIN не разрешаются.")
             client.uncertain_state = True
             reconcile_done = False
         else:
             broker = {f: p for f, p in positions.items()
                       if not f.startswith(("RUB", "USD", "EUR"))}
+            # v2.3.2-stage1 (Дефект-2): resolve_uncertain при отсутствии
+            # позиции у брокера БОЛЬШЕ НЕ закрывает учёт по одному снимку —
+            # позиция остаётся UNCERTAIN. Внешнее закрытие возможно только
+            # через единый механизм В3 в reconcile ниже (два достоверных
+            # снимка с интервалом >= RECONCILE_CONFIRM_MIN_AGE_SECONDS);
+            # закрытие по СВОЕЙ SELL-заявке — по её терминальному отчёту
+            # (resolve_closing выше / В2 в reconcile).
             for pos in uncertain_positions:
-                monitor.resolve_uncertain(pos, broker)
-            await reconcile(client, monitor)
+                # ЭТАП 5Б (§4.3): resolve_uncertain дополнительно проверяет
+                # реестр: незавершённая SELL-запись по FIGI запрещает OPEN —
+                # совпадение количества не доказывает исход потерянной SELL.
+                monitor.resolve_uncertain(pos, broker, ledger=ledger_ref)
+                # v2.3.3-stage1: защита в глубину. Инвариант: позиция с
+                # неподтверждённой терминальностью close-заявки не может
+                # оказаться в OPEN ни одним путём — SL/TP (check_all)
+                # действуют только на OPEN, повторная SELL по позиции с
+                # живой заявкой запрещена (перепродажа). resolve_uncertain
+                # уже соблюдает инвариант (execution.py); проверка
+                # страхует от регрессий будущих путей разрешения.
+                # ЭТАП 5Б: проверяются ОБЕ ссылки заявки.
+                if (pos.state == PositionState.OPEN
+                        and (pos.close_order_id or getattr(pos, "close_order_request_id", None))):
+                    logging.error(
+                        f"[process_closing] {pos.ticker}: OPEN при активной "
+                        f"close-заявке (request_id={getattr(pos, 'close_order_request_id', None)}, "
+                        f"exchange_id={pos.close_order_id}) — возврат в "
+                        f"UNCERTAIN (защита от повторной SELL)"
+                    )
+                    pos.state = PositionState.UNCERTAIN
+            # v2.3.0-stage1: передаём ledger и rm — пакет В2/В3 в reconcile
+            # требует реестр, а изменения учёта должны сохраняться немедленно.
+            await reconcile(client, monitor, ledger_ref, rm)
 
     for pos in list(monitor.positions.values()):
         if pos.state != PositionState.CLOSED or pos.logged:
@@ -974,7 +1830,22 @@ async def process_closing(client: TinkoffClient, monitor: ExecutionMonitor):
             pos.logged = True
             continue
 
-        exit_price = pos.execution_price or 0.0
+        # v2.3.1-stage1 (ТЗ-5): ЗАПРЕТ ФИКТИВНОГО P&L. Финансовые поля
+        # рассчитываются ТОЛЬКО при подтверждённой цене исполнения
+        # (exit_price_confirmed=True — цена из отчёта исполненного close-ордера
+        # этой позиции, включая В2-закрытие по реестру/брокеру). При
+        # неподтверждённой цене (внешнее закрытие, отчёт без цены) CSV-строка
+        # пишется с ПУСТЫМИ финансовыми полями и пометкой PRICE_UNKNOWN;
+        # cumulative НЕ изменяется (get_cumulative_net_pnl пропускает пустые
+        # net_pnl_rub). Прежнее поведение (exit_price=0.0 -> огромный
+        # фиктивный убыток; exit_price=entry -> фиктивный «нулевой» P&L)
+        # устранено.
+        exit_price_known = (
+            bool(getattr(pos, "exit_price_confirmed", False))
+            and pos.execution_price is not None
+            and pos.execution_price > 0
+        )
+        exit_price = pos.execution_price if exit_price_known else 0.0
         executed_lots = pos.executed_lots
         if executed_lots <= 0:
             logging.error(
@@ -984,40 +1855,97 @@ async def process_closing(client: TinkoffClient, monitor: ExecutionMonitor):
             continue
         shares = executed_lots * pos.lot_size
 
-        entry_slippage = (pos.entry_price - pos.price_before_order) * shares
-        exit_slippage = (pos.close_price_before_order - exit_price) * shares
-        total_slippage = entry_slippage + exit_slippage
+        if exit_price_known:
+            entry_slippage = (pos.entry_price - pos.price_before_order) * shares
+            exit_slippage = (pos.close_price_before_order - exit_price) * shares
+            total_slippage = entry_slippage + exit_slippage
 
-        gross_pnl = (exit_price - pos.entry_price) * shares
-        turnover = (exit_price + pos.entry_price) * shares
-        model_total_commission = abs(turnover * config.COMMISSION_PER_SIDE)
+            gross_pnl = (exit_price - pos.entry_price) * shares
+            turnover = (exit_price + pos.entry_price) * shares
+            model_total_commission = abs(turnover * config.COMMISSION_PER_SIDE)
 
-        if pos.actual_commission is not None:
-            exit_commission = pos.actual_commission
+            if pos.actual_commission is not None:
+                exit_commission = pos.actual_commission
+            else:
+                exit_commission = model_total_commission / 2.0
+
+            if pos.entry_actual_commission is not None:
+                entry_commission = pos.entry_actual_commission
+            else:
+                entry_commission = model_total_commission / 2.0
+
+            total_commission = entry_commission + exit_commission
+
+            entry_actual = pos.entry_actual_commission is not None
+            exit_actual = pos.actual_commission is not None
+            if entry_actual and exit_actual:
+                commission_source = "actual"
+            elif entry_actual or exit_actual:
+                commission_source = "mixed"
+            else:
+                commission_source = "model"
+
+            net_pnl = gross_pnl - total_commission
+            slippage_percent = (total_slippage / turnover * 100.0) if turnover > 0 else 0.0
+
+            cumulative_before = research_logger.get_cumulative_net_pnl()
+            cumulative_after = cumulative_before + net_pnl
+            # Строковые представления для CSV (подтверждённая цена).
+            exit_price_str = f"{exit_price:.4f}"
+            commission_str = f"{total_commission:.2f}"
+            actual_commission_str = f"{pos.actual_commission:.2f}" if pos.actual_commission is not None else ""
+            entry_commission_str = f"{entry_commission:.2f}"
+            exit_commission_str = f"{exit_commission:.2f}"
+            slippage_str = f"{total_slippage:+.2f}"
+            slippage_percent_str = f"{slippage_percent:+.3f}"
+            gross_pnl_str = f"{gross_pnl:.2f}"
+            net_pnl_str = f"{net_pnl:.2f}"
+            cumulative_str = f"{cumulative_after:.2f}"
         else:
-            exit_commission = model_total_commission / 2.0
+            # Цена исполнения неизвестна: финансовые поля пустые.
+            total_slippage = 0.0
+            gross_pnl = net_pnl = None
+            entry_commission = exit_commission = total_commission = None
+            commission_source = "none"
+            slippage_percent = 0.0
+            cumulative_after = None
+            exit_price_str = ""
+            commission_str = ""
+            actual_commission_str = ""
+            entry_commission_str = ""
+            exit_commission_str = ""
+            slippage_str = ""
+            slippage_percent_str = ""
+            gross_pnl_str = ""
+            net_pnl_str = ""
+            cumulative_str = ""
 
-        if pos.entry_actual_commission is not None:
-            entry_commission = pos.entry_actual_commission
+        # v2.3.0-stage1 (С1): телеметрия позиции для новых полей CSV.
+        # Для позиций из старого state.json initial_*/mae/mfe восстановлены
+        # from_dict (initial_* = текущие sl/tp, экстремумы — 0: пусто в CSV).
+        build_version = getattr(config, "BUILD_VERSION", "?")
+        entry_sl_price = float(pos.initial_sl_price or 0.0)
+        entry_tp_price = float(pos.initial_tp_price or 0.0)
+        mae_price = float(pos.mae_price or 0.0)
+        mfe_price = float(pos.mfe_price or 0.0)
+        exit_sl_price = float(pos.sl_price or 0.0)
+        risk_share = (pos.entry_price - entry_sl_price if pos.direction == "BUY"
+                      else entry_sl_price - pos.entry_price)
+        if risk_share > 0:
+            if pos.direction == "BUY":
+                mae_r = f"{(mae_price - pos.entry_price) / risk_share:.3f}" if mae_price > 0 else ""
+                mfe_r = f"{(mfe_price - pos.entry_price) / risk_share:.3f}" if mfe_price > 0 else ""
+                r_multiple = f"{(exit_price - pos.entry_price) / risk_share:.3f}" if exit_price > 0 else ""
+            else:
+                mae_r = f"{(pos.entry_price - mae_price) / risk_share:.3f}" if mae_price > 0 else ""
+                mfe_r = f"{(pos.entry_price - mfe_price) / risk_share:.3f}" if mfe_price > 0 else ""
+                r_multiple = f"{(pos.entry_price - exit_price) / risk_share:.3f}" if exit_price > 0 else ""
         else:
-            entry_commission = model_total_commission / 2.0
-
-        total_commission = entry_commission + exit_commission
-
-        entry_actual = pos.entry_actual_commission is not None
-        exit_actual = pos.actual_commission is not None
-        if entry_actual and exit_actual:
-            commission_source = "actual"
-        elif entry_actual or exit_actual:
-            commission_source = "mixed"
-        else:
-            commission_source = "model"
-
-        net_pnl = gross_pnl - total_commission
-        slippage_percent = (total_slippage / turnover * 100.0) if turnover > 0 else 0.0
-
-        cumulative_before = research_logger.get_cumulative_net_pnl()
-        cumulative_after = cumulative_before + net_pnl
+            mae_r = mfe_r = r_multiple = ""
+        hold_minutes = ""
+        start_dt = _parse_iso_ts(pos.order_send_time) or _parse_iso_ts(pos.signal_time)
+        if start_dt is not None:
+            hold_minutes = f"{(datetime.now(timezone.utc) - start_dt).total_seconds() / 60.0:.1f}"
 
         trade_row = {
             "trade_id": trade_id,
@@ -1028,39 +1956,69 @@ async def process_closing(client: TinkoffClient, monitor: ExecutionMonitor):
             "signal_time": pos.signal_time,
             "price_before_order": pos.price_before_order,
             "order_send_time": pos.order_send_time,
-            "order_id": pos.close_order_id or "",
+            # ЭТАП 5Б: столбец order_id (CSV-схема не менялась) — клиентский
+            # UUID заявки закрытия, как и раньше (ключ реестра).
+            "order_id": getattr(pos, "close_order_request_id", None) or pos.close_order_id or "",
             "execution_status": "FILL_PARTIAL" if pos.partial else "FILL",
             "requested_lots": pos.close_requested_lots or pos.quantity,
             "executed_lots": executed_lots,
             "execution_price": f"{pos.entry_price:.4f}",
             "exit_reason": pos.close_reason or "",
-            "exit_price": f"{exit_price:.4f}",
+            "exit_price": exit_price_str,
             "exit_time": datetime.now(timezone.utc).isoformat(),
-            "commission_rub": f"{total_commission:.2f}",
+            "commission_rub": commission_str,
             "commission_source": commission_source,
-            "actual_commission_rub": f"{pos.actual_commission:.2f}" if pos.actual_commission is not None else "",
-            "entry_commission_rub": f"{entry_commission:.2f}",
-            "exit_commission_rub": f"{exit_commission:.2f}",
-            "slippage_rub": f"{total_slippage:+.2f}",
-            "slippage_percent": f"{slippage_percent:+.3f}",
-            "gross_pnl_rub": f"{gross_pnl:.2f}",
-            "net_pnl_rub": f"{net_pnl:.2f}",
-            "cumulative_net_pnl_rub": f"{cumulative_after:.2f}",
-            "error_note": "",
+            "actual_commission_rub": actual_commission_str,
+            "entry_commission_rub": entry_commission_str,
+            "exit_commission_rub": exit_commission_str,
+            "slippage_rub": slippage_str,
+            "slippage_percent": slippage_percent_str,
+            "gross_pnl_rub": gross_pnl_str,
+            "net_pnl_rub": net_pnl_str,
+            "cumulative_net_pnl_rub": cumulative_str,
+            "error_note": getattr(pos, "error_note", "") or "",
+            # --- v2.3.0-stage1: телеметрия С1 ---
+            "build_version": build_version,
+            "entry_sl_price": f"{entry_sl_price:.4f}" if entry_sl_price > 0 else "",
+            "entry_tp_price": f"{entry_tp_price:.4f}" if entry_tp_price > 0 else "",
+            "mae_price": f"{mae_price:.4f}" if mae_price > 0 else "",
+            "mfe_price": f"{mfe_price:.4f}" if mfe_price > 0 else "",
+            "mae_r": mae_r,
+            "mfe_r": mfe_r,
+            "r_multiple": r_multiple,
+            "hold_minutes": hold_minutes,
+            "exit_sl_price": f"{exit_sl_price:.4f}" if exit_sl_price > 0 else "",
         }
+
+        if not exit_price_known:
+            # v2.3.1-stage1 (ТЗ-5): в error_note попадает стандартная пометка
+            # запрета фиктивного P&L (если её ещё нет — например, при
+            # штатном SL/TP-закрытии с отчётом без цены).
+            base_note = trade_row["error_note"]
+            marker = "PRICE_UNKNOWN: P&L не рассчитан (цена исполнения не подтверждена)"
+            if marker.split(":")[0] not in base_note:
+                trade_row["error_note"] = (base_note + "; " if base_note else "") + marker
 
         if research_logger.log_trade(trade_row):
             pos.logged = True
-            logging.info(
-                f"✅ [CLOSED] {pos.ticker} {pos.close_reason} "
-                f"entry={pos.entry_price:.4f} exit={exit_price:.4f} "
-                f"lots={executed_lots} gross={gross_pnl:+.2f}₽ "
-                f"net={net_pnl:+.2f}₽ cum={cumulative_after:+.2f}₽"
-            )
+            if exit_price_known:
+                logging.info(
+                    f"✅ [CLOSED] {pos.ticker} {pos.close_reason} "
+                    f"entry={pos.entry_price:.4f} exit={exit_price:.4f} "
+                    f"lots={executed_lots} gross={gross_pnl:+.2f}₽ "
+                    f"net={net_pnl:+.2f}₽ cum={cumulative_after:+.2f}₽"
+                )
+            else:
+                logging.info(
+                    f"✅ [CLOSED] {pos.ticker} {pos.close_reason} "
+                    f"entry={pos.entry_price:.4f} exit=НЕИЗВЕСТНА "
+                    f"lots={executed_lots} — P&L не рассчитан (PRICE_UNKNOWN)"
+                )
             try:
                 research_logger.log_event("CLOSED", {
                     "trade_id": trade_id, "ticker": pos.ticker, "figi": pos.figi,
-                    "entry_price": pos.entry_price, "exit_price": exit_price,
+                    "entry_price": pos.entry_price,
+                    "exit_price": exit_price if exit_price_known else None,
                     "executed_lots": executed_lots, "lot_size": pos.lot_size,
                     "gross_pnl": gross_pnl,
                     "entry_commission": entry_commission,
@@ -1069,15 +2027,24 @@ async def process_closing(client: TinkoffClient, monitor: ExecutionMonitor):
                     "slippage": total_slippage, "slippage_percent": slippage_percent,
                     "net_pnl": net_pnl, "cumulative_net_pnl": cumulative_after,
                     "exit_reason": pos.close_reason or "",
+                    "pnl_recorded": exit_price_known,
                 })
             except Exception as e:
                 logging.warning(f"[jsonl] {pos.ticker}: не удалось записать CLOSED: {type(e).__name__}: {e}")
-            await notify(
-                f"🔒 <b>{pos.ticker}</b> закрыто по {pos.close_reason}\n"
-                f"Вход: {pos.entry_price:.4f} → Выход: {exit_price:.4f}\n"
-                f"Лотов: {executed_lots} (акций: {shares})\n"
-                f"Net: <b>{net_pnl:+.2f} ₽</b>"
-            )
+            if exit_price_known:
+                await notify(
+                    f"🔒 <b>{pos.ticker}</b> закрыто по {pos.close_reason}\n"
+                    f"Вход: {pos.entry_price:.4f} → Выход: {exit_price:.4f}\n"
+                    f"Лотов: {executed_lots} (акций: {shares})\n"
+                    f"Net: <b>{net_pnl:+.2f} ₽</b>"
+                )
+            else:
+                await notify(
+                    f"🔒 <b>{pos.ticker}</b> учёт закрыт по {pos.close_reason}\n"
+                    f"Лотов: {executed_lots} (акций: {shares})\n"
+                    f"Цена исполнения неизвестна — P&L НЕ рассчитан "
+                    f"(CSV-строка с пометкой PRICE_UNKNOWN)."
+                )
         else:
             logging.error(f"[csv] {pos.ticker}: log_trade вернул False — повтор на следующем цикле.")
 
@@ -1915,7 +2882,8 @@ async def poll_open_orders(client: TinkoffClient, monitor: ExecutionMonitor,
         figi = rec.get("figi") or ""
         ticker = rec.get("ticker") or figi or "?"
 
-        state = await client.get_sandbox_order_state(order_id)
+        # ЭТАП 5Б (§5.3): опрос с ЯВНЫМ типом идентификатора записи.
+        state = await _poll_ledger_order_state(client, rec)
         if state is None:
             logging.warning(
                 f"[poll] {ticker}: статус заявки {order_id} недоступен — заявка "
@@ -2003,7 +2971,14 @@ async def poll_open_orders(client: TinkoffClient, monitor: ExecutionMonitor,
                             entry_commission=entry_commission, partial=True, df=None,
                             source="poll", ledger_status=status or "PARTIALLYFILL",
                         )
-                    cancel_resp = await client.cancel_order(order_id)
+                    # ЭТАП 5Б (§7): для записей робота (order_request_id ==
+                    # order_id — клиентский UUID) отмена строго по REQUEST;
+                    # legacy-записи без подтверждённого типа — прежнее
+                    # поведение (запрос без order_id_type), поведение не
+                    # меняется без подтверждения требуемого типа.
+                    confirmed_req = _cancel_confirmed_request_id(rec)
+                    cancel_type = "REQUEST" if confirmed_req else None
+                    cancel_resp = await client.cancel_order(order_id, order_id_type=cancel_type)
                     if cancel_resp is None:
                         ledger.record_uncertain(order_id, figi=figi, ticker=ticker,
                                                 side="BUY", executed_lots=le,
@@ -2088,7 +3063,11 @@ async def poll_open_orders(client: TinkoffClient, monitor: ExecutionMonitor,
                     f"[poll] {ticker}: заявка {order_id} не исполняется "
                     f"(возраст {age:.0f} циклов) — отмена остатка"
                 )
-                cancel_resp = await client.cancel_order(order_id)
+                # ЭТАП 5Б (§7): записи робота — отмена по REQUEST;
+                # legacy — прежнее поведение (без order_id_type).
+                confirmed_req = _cancel_confirmed_request_id(rec)
+                cancel_type = "REQUEST" if confirmed_req else None
+                cancel_resp = await client.cancel_order(order_id, order_id_type=cancel_type)
                 if cancel_resp is None:
                     ledger.record_uncertain(order_id, figi=figi, ticker=ticker,
                                             side="BUY", executed_lots=le,
@@ -2120,7 +3099,8 @@ async def poll_open_orders(client: TinkoffClient, monitor: ExecutionMonitor,
         figi = rec.get("figi") or ""
         ticker = rec.get("ticker") or figi or "?"
 
-        state = await client.get_sandbox_order_state(order_id)
+        # ЭТАП 5Б (§5.3): опрос с ЯВНЫМ типом идентификатора записи.
+        state = await _poll_ledger_order_state(client, rec)
         if state is None:
             # статус недоступен — остаётся в неопределённости, блокировка сохраняется
             continue
@@ -2150,6 +3130,103 @@ async def poll_open_orders(client: TinkoffClient, monitor: ExecutionMonitor,
             continue
         ledger.record_status(order_id, status or "NEW", executed_lots=le,
                              reason="активна (сторона неизвестна)", source="poll_unknown")
+
+
+def _try_bind_recovery_entry(monitor: ExecutionMonitor, rm: RiskManager,
+                             ledger: Optional[OrderLedger], pos) -> bool:
+    """Пакет В4: автопривязка entry_order_id к адоптированной RECOVERY-позиции.
+
+    Условия (все обязательны — иначе отказ и прежнее поведение «оператор»):
+      - позиция RECOVERY, direction BUY, без entry_order_id;
+      - в реестре ровно ОДНА BUY-заявка по этому FIGI с исполнением > 0
+        (любая вторая BUY с исполнением — неоднозначность);
+      - executed_lots этой заявки == quantity позиции;
+      - статус записи НЕ REJECTED и НЕ INTENT (отказ/неотправленная заявка
+        не может быть источником позиции);
+      - order_id не входит в closed_entry_order_ids (защита от «воскрешения»).
+
+    Запись может быть терминальной (FILL/CANCELLED/EXPIRED) или UNCERTAIN
+    (реальный кейс: адоптированная позиция + «отчёт заявки НЕ привязан...»).
+    Совпадение quantity (подтверждённого брокером при адопции) с единственным
+    исполненным BUY по FIGI — достаточное доказательство принадлежности.
+
+    При успехе: entry_order_id записывается, state.json сохраняется немедленно.
+    Реестр: терминальный статус с маркером автопривязки пишется, если запись
+    уже терминальна ИЛИ неопределённость разрешена подтверждённой сверкой
+    (_uncertainty_resolved_by_reconcile, партия P0-5). Действующая
+    UNCERTAIN-запись НЕ перезаписывается — она снимется штатным путём P0-5
+    (после успешной сверки повторным терминальным отчётом); блокировка BUY
+    по FIGI сохраняется до этого момента, привязка от этого не зависит.
+    """
+    if pos.state != PositionState.RECOVERY or pos.direction != "BUY":
+        return False
+    if pos.entry_order_id or ledger is None:
+        return False
+    try:
+        qty = int(pos.quantity)
+    except (TypeError, ValueError):
+        return False
+    if qty <= 0:
+        return False
+    buy_with_execution = []
+    for oid, rec in ledger.latest_all().items():
+        if rec.get("side") != "BUY" or rec.get("figi") != pos.figi:
+            continue
+        try:
+            executed = int(rec.get("executed_lots") or 0)
+        except (TypeError, ValueError):
+            executed = 0
+        if executed > 0:
+            buy_with_execution.append((str(oid), rec, executed))
+    if len(buy_with_execution) != 1:
+        return False
+    oid, rec, executed = buy_with_execution[0]
+    rec_status = str(rec.get("status") or "")
+    if rec_status in ("REJECTED", "INTENT"):
+        return False
+    if executed != qty:
+        return False
+    if oid in monitor.closed_entry_order_ids:
+        return False
+    pos.entry_order_id = oid
+    state_saved = _save_state_checked(monitor, rm)
+    # Реестр: терминальный статус пишется только если он не сотрёт
+    # действующую (не разрешённую сверкой) UNCERTAIN-запись (P0-5).
+    rec_uncertainty_pending = (
+        rec_status == STATUS_UNCERTAIN
+        and not _uncertainty_resolved_by_reconcile(rec)
+    )
+    if rec_status in _TERMINAL_ORDER_STATUSES or not rec_uncertainty_pending:
+        ledger.record_status(
+            oid, rec_status if rec_status in _TERMINAL_ORDER_STATUSES else "FILL",
+            trade_id=rec.get("trade_id") or "",
+            figi=pos.figi, ticker=pos.ticker, side="BUY",
+            requested_lots=int(rec.get("requested_lots") or 0),
+            executed_lots=executed,
+            avg_exec_price=rec.get("avg_exec_price"),
+            reason=(f"автопривязка к RECOVERY-позиции {pos.ticker}: единственный "
+                    f"BUY по FIGI с executed_lots == quantity ({executed}); "
+                    f"неопределённость разрешена (пакет В4)"),
+            source="recovery_autobind",
+        )
+    else:
+        logging.warning(
+            f"[recovery] {pos.ticker}: UNCERTAIN-запись заявки {oid} сохранена "
+            f"до подтверждённой сверки (P0-5); привязка выполнена, промоция "
+            f"продолжится, BUY по FIGI остаются заблокированы до разрешения"
+        )
+    logging.warning(
+        f"[recovery] {pos.ticker}: RECOVERY-позиция привязана к заявке {oid} "
+        f"(единственный BUY с исполнением, {executed} лот., "
+        f"ledger_status={rec_status}, state_saved={state_saved})"
+    )
+    research_logger.log_event("RECOVERY_ENTRY_BOUND", {
+        "figi": pos.figi, "ticker": pos.ticker, "order_id": oid,
+        "executed_lots": executed, "quantity": qty,
+        "ledger_status": rec_status, "state_saved": state_saved,
+        "uncertainty_pending": rec_uncertainty_pending,
+    })
+    return True
 
 
 async def promote_recovery_positions(client: TinkoffClient, monitor: ExecutionMonitor,
@@ -2191,14 +3268,20 @@ async def promote_recovery_positions(client: TinkoffClient, monitor: ExecutionMo
         if pos.state != PositionState.RECOVERY:
             continue
         if not pos.entry_order_id:
-            _promote_throttle["n"] += 1
-            if _promote_throttle["n"] % 20 == 1:
-                logging.warning(
-                    f"[recovery] {pos.ticker}: RECOVERY без order_id "
-                    f"(source={pos.recovery_source}) — цена входа не восстанавливается "
-                    f"автоматически; закрытие только вручную оператором"
-                )
-            continue
+            # Пакет В4: автопривязка адоптированной RECOVERY-позиции к
+            # единственному терминальному BUY-отчёту по FIGI с
+            # executed_lots == quantity. Не удалось — прежнее поведение
+            # (цена не восстанавливается автоматически, решение за оператором).
+            if not _try_bind_recovery_entry(monitor, rm, ledger, pos):
+                _promote_throttle["n"] += 1
+                if _promote_throttle["n"] % 20 == 1:
+                    logging.warning(
+                        f"[recovery] {pos.ticker}: RECOVERY без order_id "
+                        f"(source={pos.recovery_source}) — цена входа не восстанавливается "
+                        f"автоматически; закрытие только вручную оператором"
+                    )
+                continue
+            # привязка выполнена — промоция продолжается в этом же цикле
         if pos.direction != "BUY":
             # Партия P0-3: накопительное исполнение входной BUY-заявки
             # применимо только к BUY (LONG)-позициям. SHORT-RECOVERY остаётся
@@ -2212,7 +3295,9 @@ async def promote_recovery_positions(client: TinkoffClient, monitor: ExecutionMo
                 )
             continue
 
-        state = await client.get_sandbox_order_state(pos.entry_order_id)
+        # entry_order_id — клиентский UUID входной BUY-заявки робота
+        # (ЭТАП 5Б): опрос строго по ORDER_ID_TYPE_REQUEST.
+        state = await client.get_sandbox_order_state(pos.entry_order_id, order_id_type="REQUEST")
         if state is None:
             continue
 
@@ -2391,7 +3476,7 @@ async def startup_recovery(client: TinkoffClient, monitor: ExecutionMonitor,
             summary["orders_uncertain"] += 1
             continue
 
-        state = await client.get_sandbox_order_state(oid)
+        state = await _poll_ledger_order_state(client, rec)
         if state is None:
             ledger.record_uncertain(
                 oid, figi=figi, ticker=ticker, side=side,
@@ -2472,7 +3557,8 @@ async def startup_recovery(client: TinkoffClient, monitor: ExecutionMonitor,
         # Пытаемся получить актуальные данные заявки (цена исполнения);
         # при недоступности — данные из записи реестра (record_sent
         # сохраняет executed_lots и avg_exec_price).
-        state = await client.get_sandbox_order_state(oid)
+        # ЭТАП 5Б: опрос с ЯВНЫМ типом идентификатора записи.
+        state = await _poll_ledger_order_state(client, rec)
         if state is not None:
             le = int(getattr(state, "lots_executed", 0) or 0) or le
             info = await client.get_instrument_info(figi) if figi else None
@@ -2502,6 +3588,17 @@ async def startup_recovery(client: TinkoffClient, monitor: ExecutionMonitor,
         summary["orders_executed"] += 1
 
     # 2. Активные заявки брокера, неизвестные реестру
+    #    ЭТАП 5Б (§5.4): связывание по OrderState.order_request_id (КЛИЕНТСКИЙ
+    #    UUID) — активная заявка брокера, у которой order_request_id совпадает
+    #    с ключом записи реестра, является УЖЕ ИЗВЕСТНОЙ заявкой робота:
+    #      - вторая (дублирующая) запись реестра НЕ создаётся;
+    #      - биржевой ID (OrderState.order_id) сохраняется в существующей
+    #        записи отдельным полем exchange_order_id;
+    #      - заявка связывается с исходной позицией (восстанавливаются ОБЕ
+    #        ссылки позиции: close_order_request_id и close_order_id),
+    #        ТОЛЬКО при однозначном совпадении figi+trade_id; при
+    #        неоднозначности/нескольких кандидатах привязки нет —
+    #        неопределённость сохраняется, новых заявок не отправляется.
     orders = await client.get_sandbox_orders()
     if orders is None:
         summary["orders_unavailable"] = True
@@ -2509,7 +3606,36 @@ async def startup_recovery(client: TinkoffClient, monitor: ExecutionMonitor,
         logging.error("[startup] Список активных заявок недоступен.")
     else:
         for o in orders:
-            oid = getattr(o, "order_id", None)
+            oid = getattr(o, "order_id", None)            # БИРЖЕВОЙ ID
+            req_id = getattr(o, "order_request_id", None)  # КЛИЕНТСКИЙ UUID
+            linked_key = None
+            if req_id and ledger.has_order(str(req_id)):
+                linked_key = str(req_id)
+            if linked_key is not None:
+                # Известная заявка: обновляем существующую запись реестра
+                # (append-only) — добавляем биржевой ID, дубликата НЕТ.
+                rec = ledger.latest(linked_key)
+                ledger.record_status(
+                    linked_key, str(rec.get("status") or "NEW"),
+                    exchange_order_id=str(oid) if oid else None,
+                    order_request_id=linked_key,
+                    reason="связь с активной заявкой брокера восстановлена "
+                           "по order_request_id (GetSandboxOrders)",
+                    source="startup_link",
+                )
+                if _link_broker_order_to_position(monitor, linked_key,
+                                                  str(oid) if oid else None, rec):
+                    logging.info(
+                        f"[startup] заявка брокера {oid} (request_id={linked_key}) "
+                        f"связана с позицией {rec.get('figi')} — биржевой ID восстановлен"
+                    )
+                else:
+                    logging.warning(
+                        f"[startup] заявка брокера {oid} (request_id={linked_key}) "
+                        f"известна реестру, но однозначная привязка к позиции "
+                        f"не выполнена — неопределённость сохраняется"
+                    )
+                continue
             if not oid or ledger.has_order(str(oid)):
                 continue
             figi = getattr(o, "figi", None)
@@ -2523,6 +3649,7 @@ async def startup_recovery(client: TinkoffClient, monitor: ExecutionMonitor,
                 str(oid), figi=figi, side=side,
                 requested_lots=int(getattr(o, "lots_requested", 0) or 0),
                 executed_lots=int(getattr(o, "lots_executed", 0) or 0),
+                order_request_id=str(req_id) if req_id else None,
                 reason="активная заявка брокера без записи в реестре", source="startup",
             )
             summary["unknown_broker_orders"] += 1
@@ -2582,9 +3709,13 @@ async def startup_recovery(client: TinkoffClient, monitor: ExecutionMonitor,
 # ============================================================
 
 async def trading_cycle(client: TinkoffClient, rm: RiskManager, sm: StrategyManager, monitor: ExecutionMonitor, ledger: Optional[OrderLedger] = None):
-    global reconcile_done
+    global reconcile_done, monitor_ref
     if ledger is None:
         ledger = ledger_ref
+    # ЭТАП 5Б: monitor_ref используется close_position для регистрации
+    # намерения SELL в журнале позиции ДО отправки (та же ссылка, что и в
+    # main(); присваивание ссылки идемпотентно, учёт не меняет).
+    monitor_ref = monitor
 
     # 1. Цены: TOP-10 + открытые позиции
     figi_set = set(p.figi for p in monitor.positions.values())
@@ -2598,7 +3729,15 @@ async def trading_cycle(client: TinkoffClient, rm: RiskManager, sm: StrategyMana
         prices = {}
 
     # 2. SL/TP
-    to_close = await monitor.check_all(prices)
+    # С1: свечные экстремумы и ATR — ТОЛЬКО при включённом безубытке/трейлинге
+    # (config.BE_TRAIL_ENABLED, по умолчанию False — ноль доп. вызовов API).
+    extremes, atrs = {}, {}
+    if getattr(config, "BE_TRAIL_ENABLED", False):
+        open_figis = [p.figi for p in monitor.positions.values()
+                      if p.state == PositionState.OPEN]
+        if open_figis:
+            extremes, atrs = await _fetch_extremes_and_atrs(client, open_figis)
+    to_close = await monitor.check_all(prices, extremes=extremes or None, atrs=atrs or None)
     for pos in to_close:
         price = prices.get(pos.figi)
         if price is None or price <= 0:
@@ -2609,7 +3748,7 @@ async def trading_cycle(client: TinkoffClient, rm: RiskManager, sm: StrategyMana
         await close_position(client, pos, price)
 
     # 3. Обработка закрытий и UNCERTAIN
-    await process_closing(client, monitor)
+    await process_closing(client, monitor, rm)
 
     # 3.5 Этап 5: пошаговый контроль незавершённых BUY-заявок (не блокирует цикл)
     if ledger is not None:
@@ -2619,14 +3758,26 @@ async def trading_cycle(client: TinkoffClient, rm: RiskManager, sm: StrategyMana
     if ledger is not None:
         await promote_recovery_positions(client, monitor, rm, ledger)
 
-    # 4. Если uncertain — reconcile
+    # 4. Сверка с брокером — теперь В КАЖДОМ штатном цикле (v2.3.1-stage1, ТЗ-1/2).
+    # Раньше reconcile запускался только при uncertain_state / UNCERTAIN-позициях /
+    # на старте: ручная продажа позиции в приложении брокера не выставляет ни
+    # один из этих флагов, поэтому пакет В2/В3 (живущий внутри reconcile) в
+    # штатном цикле не срабатывал — фантомная OPEN-позиция мониторилась до
+    # рестарта, а при срабатывании SL/TP по ней отправлялись обречённые
+    # SELL-заявки (отказ брокера -> обратно OPEN -> снова SELL). Теперь
+    # исчезновение позиции обнаруживается по ДОСТОВЕРНОМУ снимку брокера в
+    # каждом цикле: В2 закрывает учёт по своей SELL-заявке, В3 требует два
+    # последовательных достоверных снимка с разносом не меньше
+    # RECONCILE_CONFIRM_MIN_AGE_SECONDS (двойное подтверждение сохранено;
+    # недостоверный снимок None подтверждением не является — reconcile
+    # при None выходит раньше, учёт не меняется). Стоимость: один
+    # get_positions() за цикл — такой же вызов и так выполняется на шаге 6
+    # перед входами.
+    await reconcile(client, monitor, ledger, rm)
     if client.is_uncertain():
-        logging.warning("[cycle] uncertain_state=True — пробую reconcile.")
-        await reconcile(client, monitor, ledger, rm)
-        if client.is_uncertain():
-            logging.warning("[cycle] reconcile не снял UNCERTAIN — новые входы запрещены.")
-            _save_state_checked(monitor, rm)
-            return
+        logging.warning("[cycle] reconcile не снял UNCERTAIN — новые входы запрещены.")
+        _save_state_checked(monitor, rm)
+        return
 
     # 5. Блокировки входов
     if not is_trading_enabled():
@@ -2795,12 +3946,16 @@ async def trading_cycle(client: TinkoffClient, rm: RiskManager, sm: StrategyMana
             _save_state_checked(monitor, rm)
             continue
 
-        # Этап 5: SENT сразу после ответа (post-ответ уже содержит статус и исполнение)
+        # Этап 5: SENT сразу после ответа (post-ответ уже содержит статус и исполнение).
+        # ЭТАП 5Б (§5.2): биржевой ID из PostOrderResponse.order_id сохраняется
+        # в записи реестра (не отбрасывается); order_request_id — клиентский UUID.
         if ledger is not None:
             ledger.record_sent(
                 order_id, trade_id=trade_id, figi=figi, ticker=inst['ticker'],
                 side="BUY", requested_lots=lots, executed_lots=sent_le,
                 status_hint=sent_status_name, source="post_response",
+                exchange_order_id=getattr(result, "exchange_order_id", None),
+                order_request_id=order_id,
             )
 
         status = getattr(result.state, 'execution_report_status', None)
@@ -2815,7 +3970,9 @@ async def trading_cycle(client: TinkoffClient, rm: RiskManager, sm: StrategyMana
             research_logger.log_event("PARTIAL_FILL", {"trade_id": trade_id, "order_id": order_id})
             client.uncertain_state = True
 
-            cancel_resp = await client.cancel_order(order_id)
+            # ЭТАП 5Б (§7): order_id — КЛИЕНТСКИЙ UUID этой же заявки
+            # (сгенерирован роботом до отправки) — отмена по REQUEST.
+            cancel_resp = await client.cancel_order(order_id, order_id_type="REQUEST")
             if cancel_resp is None:
                 logging.error(f"{inst['ticker']}: cancel_order вернул None — UNCERTAIN; заявка остаётся в реестре")
                 if ledger is not None:
@@ -2825,7 +3982,9 @@ async def trading_cycle(client: TinkoffClient, rm: RiskManager, sm: StrategyMana
                 _save_state_checked(monitor, rm)
                 continue
 
-            final_state = await client.get_sandbox_order_state(order_id)
+            # ЭТАП 5Б: статус заявки после отмены — запрос по REQUEST
+            # (клиентский UUID НЕ передаётся как биржевой ID).
+            final_state = await client.get_sandbox_order_state(order_id, order_id_type="REQUEST")
             if final_state is None:
                 logging.error(f"{inst['ticker']}: final state=None — UNCERTAIN; заявка остаётся в реестре")
                 if ledger is not None:
@@ -2943,8 +4102,9 @@ async def trading_cycle(client: TinkoffClient, rm: RiskManager, sm: StrategyMana
                 _save_state_checked(monitor, rm)
                 continue
 
-            # Запросить фактическое состояние заявки
-            state = await client.get_sandbox_order_state(order_id)
+            # Запросить фактическое состояние заявки.
+            # ЭТАП 5Б: order_id — клиентский UUID, опрос по REQUEST.
+            state = await client.get_sandbox_order_state(order_id, order_id_type="REQUEST")
             if state is None:
                 logging.error(
                     f"{inst['ticker']}: state=None после не-FILL (order_id={order_id}) — UNCERTAIN; "
@@ -2988,7 +4148,9 @@ async def trading_cycle(client: TinkoffClient, rm: RiskManager, sm: StrategyMana
             continue
 
         # --- FILL (этап 5: подтверждённое исполнение не может быть потеряно; D1 устранён) ---
-        state = await client.get_sandbox_order_state(order_id) if order_id else None
+        # ЭТАП 5Б: order_id — клиентский UUID, опрос по REQUEST.
+        state = (await client.get_sandbox_order_state(order_id, order_id_type="REQUEST")
+                 if order_id else None)
         if state is None:
             # Ответ post_sandbox_order уже подтвердил FILL. Дефект D1(а) устранён:
             # регистрируем позицию по данным post-ответа (RECOVERY при неполных данных),
@@ -3044,6 +4206,13 @@ async def trading_cycle(client: TinkoffClient, rm: RiskManager, sm: StrategyMana
             partial=False, df=df, source="fill_branch", ledger_status="FILL",
         )
         _save_state_checked(monitor, rm)
+
+    # Пакет В1: безусловное сохранение в КОНЦЕ КАЖДОГО цикла. Раньше тихий
+    # цикл (HOLD, без входов/ошибок) не сохранял CLOSED/CLOSING-переходы:
+    # рестарт возвращал проданные позиции как фантомные OPEN ->
+    # вечный RECONCILE_MISMATCH. Теперь окно устаревания state.json —
+    # максимум один цикл (~TRADING_CYCLE_SECONDS).
+    _save_state_checked(monitor, rm)
 
 
 # ============================================================

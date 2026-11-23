@@ -2,6 +2,8 @@
 # Tsclp_v2.1_volatile — конфигурация.
 # STRATEGY LOGIC: UNCHANGED. RESEARCH ONLY.
 # ИЗМЕНЕНО: PROFILE = "CONSERVATIVE" (после стабилизации механики).
+# v2.3.0-stage1: секция "Ступень 1" (безубыток/трейлинг — ВЫКЛЮЧЕНЫ по
+# умолчанию) и BUILD_VERSION. Стратегия входа и риск-модель НЕ менялись.
 
 import os
 from dotenv import load_dotenv
@@ -39,6 +41,17 @@ MAX_POSITION_SHARE_PER_INSTRUMENT = 0.2
 MAX_TOTAL_EXPOSURE = 0.6
 MAX_TRADES_PER_INSTRUMENT_PER_DAY = 5
 
+# --- Ступень 1 (v2.3.0-stage1): безубыток/трейлинг и версия сборки ---
+# ВНИМАНИЕ: BE_TRAIL_ENABLED=False — механика ВЫКЛЮЧЕНА. Включать явным True
+# только после того, как пакет В (В1-В4) проверен в поле и журнал стабилен.
+# При True каждый цикл запрашивает свечи по каждой OPEN-позиции (экстремумы
+# и ATR) — доп. нагрузка ~1 запрос/позиция/цикл.
+BUILD_VERSION = "v2.3.2-stage1"
+BE_TRAIL_ENABLED = False
+BE_TRIGGER_R = 1.0          # r_peak по ДОСТИГНУТОМУ максимуму (mfe_price) для перевода в безубыток
+TRAIL_ATR_PERIOD = 14       # период ATR для трейлинга (5-минутные свечи)
+TRAIL_ATR_MULTIPLIER = 3.0  # дистанция трейлинга: SL = mfe - 3*ATR (BUY; для SELL зеркально)
+
 # --- Семантика quantity из get_positions() ---
 POSITION_QUANTITY_IS_LOTS = True
 
@@ -60,7 +73,7 @@ MIN_CANDLES_FOR_SIGNAL = 60
 ADX_PERIOD = 14
 
 # --- Профиль фильтров ---
-PROFILE = "CONSERVATIVE"
+PROFILE = "FORCE_TRADE"
 
 if PROFILE == "FORCE_TRADE":
     ADX_TREND_THRESHOLD = 5
@@ -117,6 +130,16 @@ API_CALL_DELAY_SECONDS = 0.03
 TRADING_CYCLE_SECONDS = 30
 CANDLES_LOOKBACK_DAYS = 2
 
+# v2.3.1-stage1 (ТЗ-3): двойное подтверждение В3 принимается, только если
+# между первым обнаружением (позиция отсутствует на ДОСТОВЕРНОМ снимке) и
+# подтверждением прошло не меньше этого времени. По умолчанию = один
+# торговый цикл: два reconcile в одном цикле (process_closing + шаг 4)
+# подтверждением не считаются. Недостоверный снимок (None) подтверждением
+# не является в любом случае (учёт не меняется, маркер не выставляется).
+# Код использует getattr(config, ...) - старый config.py без этой
+# константы продолжает работать (fallback TRADING_CYCLE_SECONDS).
+RECONCILE_CONFIRM_MIN_AGE_SECONDS = TRADING_CYCLE_SECONDS
+
 # --- Отчётность ---
 STARTING_BALANCE = os.getenv("STARTING_BALANCE")
 
@@ -137,4 +160,4 @@ def validate():
     if missing:
         raise RuntimeError("Не заданы: " + ", ".join(missing))
     if not USE_SANDBOX:
-        raise RuntimeError("USE_SANDBOX=False запрещён. Только песочница.")
+        raise RuntimeError("USE_SANDBOX=False запрещён. Только песочница.")

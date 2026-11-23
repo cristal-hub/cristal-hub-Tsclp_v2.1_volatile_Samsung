@@ -1,6 +1,21 @@
 # order_ledger.py
 # Durable append-only order journal with per-order execution application history.
 # Backward-compatible with the public API used by the current main.py.
+#
+# ЭТАП 5Б: записи заявок хранят ОБА идентификатора (в конец RECORD_FIELDS,
+# старые записи читаются без ошибок, поле может быть None):
+#   order_id           — ключ записи; у заявок, созданных роботом
+#                        (record_intent ДО отправки), это КЛИЕНТСКИЙ UUID
+#                        (исторический смысл ключа НЕ меняется);
+#   exchange_order_id  — БИРЖЕВОЙ ID заявки (заполняется из
+#                        PostOrderResponse.order_id / OrderState.order_id,
+#                        когда становится известен);
+#   order_request_id   — КЛИЕНТСКИЙ UUID (ключ идемпотентности;
+#                        record_intent фиксирует его = order_id, что
+#                        доказывает: ключ записи — клиентский UUID, и опрос
+#                        статуса должен идти по ORDER_ID_TYPE_REQUEST).
+# Смешение клиентского UUID и биржевого ID устранено: биржевой ID НЕ
+# отбрасывается, клиентский UUID НЕ подменяется на биржевой и наоборот.
 
 import hashlib
 import json
@@ -27,6 +42,8 @@ RECORD_FIELDS = [
     "timestamp_utc", "status", "order_id", "trade_id", "figi", "ticker",
     "side", "requested_lots", "executed_lots", "lots_left",
     "avg_exec_price", "reason", "source", "error", "created_at_utc", "updated_at_utc",
+    # ЭТАП 5Б: добавлены В КОНЕЦ — старые записи читаются без ошибок.
+    "exchange_order_id", "order_request_id",
 ]
 IDENTITY_FIELDS = ("order_id", "trade_id", "figi", "side", "requested_lots")
 
@@ -81,6 +98,10 @@ class OrderLedger:
         ts = rec.get("timestamp_utc")
         out["created_at_utc"] = rec.get("created_at_utc") or ts
         out["updated_at_utc"] = rec.get("updated_at_utc") or ts
+        # ЭТАП 5Б: новые идентификаторы — None/пусто у старых записей.
+        for key in ("exchange_order_id", "order_request_id"):
+            value = rec.get(key)
+            out[key] = str(value) if value else None
         return out
 
     def load(self) -> None:
@@ -149,6 +170,14 @@ class OrderLedger:
             if value is None and prev is not None and key in ("trade_id", "figi", "ticker", "side", "requested_lots"):
                 value = prev.get(key)
             record[key] = value
+        # ЭТАП 5Б: идентификаторы переносятся из запроса; при отсутствии в
+        # запросе наследуются от предыдущей записи этой же заявки (как
+        # identity-поля) — биржевой ID/request ID не теряются между статусами.
+        for key in ("exchange_order_id", "order_request_id"):
+            value = fields.get(key)
+            if value is None and prev is not None:
+                value = prev.get(key)
+            record[key] = str(value) if value else None
         # Even legacy callers cannot silently move cumulative execution backwards
         # or beyond the immutable requested quantity.
         if prev is not None and fields.get("executed_lots") is not None and status != STATUS_UNCERTAIN:
@@ -185,15 +214,21 @@ class OrderLedger:
         if str(order_id) in self._latest:
             self._mark_unreliable(f"повторный INTENT для order_id={order_id}")
             return False
+        # ЭТАП 5Б: ключ записи робота — КЛИЕНТСКИЙ UUID (idempotency key,
+        # переданный в PostOrderRequest.order_id). Фиксируем это в самой
+        # записи: order_request_id == order_id доказывает тип ключа, и
+        # опрос статуса такой заявки обязан идти по ORDER_ID_TYPE_REQUEST.
         return self.append(STATUS_INTENT, order_id, trade_id=trade_id, figi=figi,
                            ticker=ticker, side=side, requested_lots=requested_lots,
-                           reason=reason, source="pre_send")
+                           reason=reason, source="pre_send",
+                           order_request_id=str(order_id))
 
     def record_sent(self, order_id: str, *, trade_id: str = None, figi: str = None,
                     ticker: str = None, side: str = None, requested_lots: int = None,
                     executed_lots: int = None, avg_exec_price: float = None,
                     status_hint: str = None, reason: str = "", source: str = "post_response",
-                    error: str = None) -> bool:
+                    error: str = None,
+                    exchange_order_id: str = None, order_request_id: str = None) -> bool:
         status = STATUS_SENT if status_hint is None else status_hint
         if status == STATUS_FILL:
             try:
@@ -206,24 +241,30 @@ class OrderLedger:
                     reason="FILL без подтверждённого executed_lots > 0", source=source, error=error)
         return self.append(status, order_id, trade_id=trade_id, figi=figi, ticker=ticker,
                            side=side, requested_lots=requested_lots, executed_lots=executed_lots,
-                           avg_exec_price=avg_exec_price, reason=reason, source=source, error=error)
+                           avg_exec_price=avg_exec_price, reason=reason, source=source, error=error,
+                           exchange_order_id=exchange_order_id,
+                           order_request_id=order_request_id)
 
     def record_status(self, order_id: str, status: str, *, trade_id: str = None,
                       figi: str = None, ticker: str = None, side: str = None,
                       requested_lots: int = None, executed_lots: int = None,
                       lots_left: int = None, avg_exec_price: float = None,
-                      reason: str = "", source: str = "", error: str = None) -> bool:
+                      reason: str = "", source: str = "", error: str = None,
+                      exchange_order_id: str = None, order_request_id: str = None) -> bool:
         return self.append(status, order_id, trade_id=trade_id, figi=figi, ticker=ticker,
             side=side, requested_lots=requested_lots, executed_lots=executed_lots,
-            lots_left=lots_left, avg_exec_price=avg_exec_price, reason=reason, source=source, error=error)
+            lots_left=lots_left, avg_exec_price=avg_exec_price, reason=reason, source=source, error=error,
+            exchange_order_id=exchange_order_id, order_request_id=order_request_id)
 
     def record_uncertain(self, order_id: str, *, trade_id: str = None, figi: str = None,
                          ticker: str = None, side: str = None, requested_lots: int = None,
                          executed_lots: int = None, avg_exec_price: float = None,
-                         reason: str = "", source: str = "", error: str = None) -> bool:
+                         reason: str = "", source: str = "", error: str = None,
+                         exchange_order_id: str = None, order_request_id: str = None) -> bool:
         return self.append(STATUS_UNCERTAIN, order_id, trade_id=trade_id, figi=figi,
             ticker=ticker, side=side, requested_lots=requested_lots, executed_lots=executed_lots,
-            avg_exec_price=avg_exec_price, reason=reason, source=source, error=error)
+            avg_exec_price=avg_exec_price, reason=reason, source=source, error=error,
+            exchange_order_id=exchange_order_id, order_request_id=order_request_id)
 
     # ---- New exact per-order cumulative execution / apply protocol ----
     def record_observation(self, order_id: str, *, executed_lots: int, status: str,
@@ -394,6 +435,13 @@ class OrderLedger:
             if rec["status"] not in NON_TERMINAL_STATUSES or rec.get("figi") != figi:
                 continue
             if rec.get("side") in ("BUY", None) or rec["status"] == STATUS_UNCERTAIN:
+                return True
+            # ЭТАП 5Б (§4.2 постановки): незавершённая/неопределённая SELL
+            # по FIGI ТОЖЕ блокирует новые BUY: судьба предыдущей заявки
+            # неизвестна — до её терминального разрешения новые заявки по
+            # этому инструменту запрещены (защита от повторной SELL и
+            # от входа поверх неопределённого закрытия).
+            if rec.get("side") == "SELL":
                 return True
         return False
 

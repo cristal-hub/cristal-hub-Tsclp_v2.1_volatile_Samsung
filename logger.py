@@ -2,6 +2,17 @@
 # Tsclp_v2.1_volatile — журнал событий и сделок.
 # ИЗМЕНЕНО: log_trade() возвращает bool; _ensure_files() защищён от ошибок
 #           (не падает при недоступной директории); log_event не падает.
+# v2.3.0-stage1:
+#   - TRADE_FIELDS дополнены в КОНЕЦ (build_version, entry_sl_price,
+#     entry_tp_price, mae_price, mfe_price, mae_r, mfe_r, r_multiple,
+#     hold_minutes, exit_sl_price);
+#   - log_event добавляет build_version;
+#   - _ensure_files() АВТО-МИГРАЦИЯ шапки: несовпадение шапки существующего
+#     CSV с текущей схемой -> старый журнал переименовывается в
+#     research_trades_<timestamp>.bak.csv (данные сохраняются), создаётся
+#     новый файл с актуальной шапкой. Это закрывает проблему смешения
+#     схем разных сборок в одном CSV навсегда; cumulative после миграции
+#     начинается заново (старый файл остаётся рядом).
 
 import csv
 import json
@@ -26,6 +37,10 @@ TRADE_FIELDS = [
     "slippage_rub", "slippage_percent",
     "gross_pnl_rub", "net_pnl_rub", "cumulative_net_pnl_rub",
     "error_note",
+    # --- v2.3.0-stage1: расширенная телеметрия позиции (только в конец) ---
+    "build_version", "entry_sl_price", "entry_tp_price",
+    "mae_price", "mfe_price", "mae_r", "mfe_r",
+    "r_multiple", "hold_minutes", "exit_sl_price",
 ]
 
 
@@ -41,13 +56,45 @@ def _file_is_empty_or_header_only(path: str) -> bool:
         return False
 
 
+def _csv_header_matches(path: str) -> bool:
+    """True, если первая строка файла совпадает с текущей шапкой TRADE_FIELDS."""
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            first = f.readline().rstrip("\r\n")
+        if not first:
+            return False
+        return first == ";".join(TRADE_FIELDS)
+    except Exception:
+        return False
+
+
 def _ensure_files() -> bool:
-    """Создаёт файлы при необходимости. Возвращает True при успехе."""
+    """Создаёт файлы при необходимости. Несовпадение шапки CSV — авто-миграция:
+    старый журнал переименовывается в research_trades_<timestamp>.bak.csv,
+    создаётся новый с актуальной шапкой. Возвращает True при успехе."""
     try:
         if not os.path.isfile(EVENTS_FILE):
             with open(EVENTS_FILE, "w", encoding="utf-8"):
                 pass
-        if not os.path.isfile(TRADES_FILE) or _file_is_empty_or_header_only(TRADES_FILE):
+        if not os.path.isfile(TRADES_FILE):
+            with open(TRADES_FILE, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=TRADE_FIELDS, delimiter=";")
+                writer.writeheader()
+        elif _file_is_empty_or_header_only(TRADES_FILE):
+            # пустой или только шапка — просто переписываем с текущей схемой
+            with open(TRADES_FILE, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=TRADE_FIELDS, delimiter=";")
+                writer.writeheader()
+        elif not _csv_header_matches(TRADES_FILE):
+            # v2.3.0-stage1: схема изменилась — данные не теряем, мигрируем
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            backup = TRADES_FILE.replace(".csv", f"_{stamp}.bak.csv")
+            os.replace(TRADES_FILE, backup)
+            logging.warning(
+                f"[logger] Шапка {TRADES_FILE} не совпадает с текущей схемой — "
+                f"старый журнал сохранён как {backup}; создан новый файл "
+                f"(сбор начинается заново, cumulative сброшен)"
+            )
             with open(TRADES_FILE, "w", encoding="utf-8", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=TRADE_FIELDS, delimiter=";")
                 writer.writeheader()
@@ -66,6 +113,7 @@ def log_event(event_type: str, payload: dict) -> bool:
         "event": event_type,
         "config_profile": getattr(config, "PROFILE", "?"),
         "commission_mode": getattr(config, "COMMISSION_MODE", "?"),
+        "build_version": getattr(config, "BUILD_VERSION", "?"),
         **payload,
     }
     try:
@@ -109,4 +157,4 @@ def get_cumulative_net_pnl() -> float:
                     continue
     except Exception as e:
         logging.warning(f"[logger] Не удалось посчитать cumulative: {e}")
-    return total
+    return total

@@ -50,6 +50,28 @@
 #     через asyncio.wait_for (дефект D8: зависание await-вызова без таймаута).
 #   - get_sandbox_orders() — новый метод: список АКТИВНЫХ заявок брокера
 #     (для четырёхсторонней сверки при рестарте). None при ошибке.
+#
+# ИЗМЕНЕНИЯ (ЭТАП 5Б — разделение клиентского UUID и биржевого order_id):
+#   Постановка (Этап 5А, аудит идентификаторов): клиентский UUID
+#   (idempotency key) и биржевой ID — РАЗНЫЕ идентификаторы:
+#     - PostOrderRequest.order_id        = клиентский UUID;
+#     - PostOrderResponse.order_id       = БИРЖЕВОЙ ID;
+#     - PostOrderResponse.order_request_id = клиентский UUID;
+#     - OrderState.order_id              = БИРЖЕВОЙ ID;
+#     - OrderState.order_request_id      = клиентский UUID.
+#   Прежний код сохранял в OrderResult.order_id клиентский UUID и
+#   ТЕРЯЛ биржевой ID из PostOrderResponse, после чего использовал UUID
+#   там, где API ожидает биржевой ID. Исправление:
+#   - OrderResult: сохранены ОБА идентификатора (order_id — клиентский
+#     UUID для совместимости; exchange_order_id — биржевой;
+#     order_request_id — клиентский из ответа). Биржевой ID больше
+#     НЕ отбрасывается и НЕ подменяется клиентским UUID.
+#   - get_sandbox_order_state(order_id, order_id_type=None): ЯВНЫЙ тип
+#     идентификатора ("EXCHANGE" / "REQUEST" / None — прежнее поведение).
+#     Если запрошен тип, но SDK не позволяет его передать —
+#     НЕИМИТИРУЕТСЯ успешный поиск: возвращается None (fail-closed),
+#     вызывающий код оставляет позицию в UNCERTAIN.
+#   - cancel_order(order_id, order_id_type=None): тот же контракт.
 
 import asyncio
 import logging
@@ -78,6 +100,37 @@ try:
 except ImportError:
     from t_tech.invest import GetMaxLotsRequest
 
+# ЭТАП 5Б: enum Order_id_type (ORDER_ID_TYPE_EXCHANGE / ORDER_ID_TYPE_REQUEST)
+# — по официальному контракту T-Invest API GetOrderState/CancelOrder.
+# Путь импорта различается между сборками SDK — как у GetMaxLotsRequest.
+# Если SDK не экспортирует enum — явный запрос по REQUEST/EXCHANGE
+# выполняться НЕ будет (fail-closed в get_sandbox_order_state/cancel_order).
+
+try:
+    from t_tech.invest.schemas import OrderIdType
+except ImportError:
+    OrderIdType = None
+
+
+def _order_id_type_member(kind):
+    """Resolve order ID type to SDK enum member."""
+    if kind is None:
+        return None, True
+
+    if OrderIdType is None:
+        return None, False
+
+    if isinstance(kind, str):
+        member = getattr(
+            OrderIdType,
+            f"ORDER_ID_TYPE_{kind.upper()}",
+            None
+        )
+        return member, member is not None
+
+    return kind, True
+
+
 import config
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -97,10 +150,24 @@ class PositionData:
 
 @dataclass
 class OrderResult:
-    """Результат отправки заявки. order_id сохраняется даже при ошибке."""
+    """Результат отправки заявки. order_id сохраняется даже при ошибке.
+
+    ЭТАП 5Б: три РАЗНЫХ идентификатора, не смешивать:
+      order_id          — клиентский UUID, переданный в заявке
+                          (idempotency key; сохранён даже при потере ответа;
+                          имя поля — прежнее, совместимость с вызывающим кодом);
+      exchange_order_id — БИРЖЕВОЙ ID из PostOrderResponse.order_id
+                          (None при потере ответа/ошибке — НЕ подменяется
+                          клиентским UUID);
+      order_request_id  — клиентский UUID из PostOrderResponse.order_request_id
+                          (None при потере ответа; совпадает с order_id,
+                          когда ответ получен).
+    """
     order_id: str
     state: Optional[object]    # OrderState | None
     error: Optional[Exception]
+    exchange_order_id: Optional[str] = None
+    order_request_id: Optional[str] = None
 
 
 # Префиксы FIGI валютных позиций (fallback, если instrument_type не получен)
@@ -488,14 +555,23 @@ class TinkoffClient:
     async def post_market_order(self, figi, quantity, direction, order_id: Optional[str] = None) -> OrderResult:
         """
         Отправляет рыночную заявку.
-        Возвращает OrderResult(order_id, state, error).
-        order_id сохраняется ДАЖЕ при исключении (потеря ответа).
-        Вызывающий код НЕ должен повторно отправлять заявку при state=None.
+        Возвращает OrderResult(order_id, state, error, exchange_order_id,
+        order_request_id).
+        order_id (клиентский UUID) сохраняется ДАЖЕ при исключении
+        (потеря ответа). Вызывающий код НЕ должен повторно отправлять
+        заявку при state=None.
 
         Этап 5: order_id может быть передан вызывающим кодом — он генерируется
         ДО записи INTENT в OrderLedger, поэтому намерение и фактическая заявка
         гарантированно имеют один и тот же идентификатор. При order_id=None
         идентификатор генерируется здесь (прежнее поведение, совместимость).
+
+        ЭТАП 5Б: при полученном ответе дополнительно извлекаются ОБА
+        идентификатора PostOrderResponse:
+          exchange_order_id = response.order_id        (БИРЖЕВОЙ ID);
+          order_request_id  = response.order_request_id (клиентский UUID).
+        При потере ответа оба остаются None — клиентский UUID и так
+        известен вызывающему коду, биржевой ID НЕИЗВЕСТЕН и НЕ выдумывается.
         """
         if not order_id:
             order_id = str(uuid.uuid4())
@@ -506,15 +582,38 @@ class TinkoffClient:
                 direction=direction, order_type=OrderType.ORDER_TYPE_MARKET,
                 order_id=order_id,
             )
-            return OrderResult(order_id=order_id, state=response, error=None)
+            # ЭТАП 5Б: биржевой ID и клиентский request ID из ответа —
+            # оба сохраняются, никакой подмены.
+            exchange_order_id = getattr(response, "order_id", None)
+            order_request_id = getattr(response, "order_request_id", None)
+            return OrderResult(
+                order_id=order_id,
+                state=response,
+                error=None,
+                exchange_order_id=str(exchange_order_id) if exchange_order_id else None,
+                order_request_id=str(order_request_id) if order_request_id else None,
+            )
         except Exception as e:
             logging.error(f"Ошибка заявки {figi} (order_id={order_id}): {type(e).__name__}: {e}")
             self.uncertain_state = True
             return OrderResult(order_id=order_id, state=None, error=e)
 
-    async def get_sandbox_order_state(self, order_id: str):
+    async def get_sandbox_order_state(self, order_id: str, order_id_type=None):
         """
         Статус заявки по order_id (источник истины — брокер).
+
+        ЭТАП 5Б: order_id_type — ЯВНЫЙ тип передаваемого идентификатора:
+          None       — прежнее поведение (запрос без order_id_type);
+          "EXCHANGE" — order_id это БИРЖЕВОЙ ID (ORDER_ID_TYPE_EXCHANGE);
+          "REQUEST"  — order_id это КЛИЕНТСКИЙ UUID, ключ идемпотентности
+                       (ORDER_ID_TYPE_REQUEST).
+        Клиентский UUID НЕЛЬЗЯ передавать как биржевой ID и наоборот —
+        тип указывается вызывающим кодом явно.
+
+        Если запрошен явный тип, но SDK не экспортирует enum Order_id_type
+        или не принимает параметр, достоверный запрос НЕВОЗМОЖЕН:
+        возвращается None (состояние НЕИЗВЕСТНО, fail-closed) — успешный
+        поиск НЕ имитируется, вызывающий код оставляет позицию в UNCERTAIN.
 
         Возвращает OrderState при успехе, None при ошибке/недоступности.
         ВАЖНО (согласовано с владельцем): None — это «статус неизвестен».
@@ -524,29 +623,57 @@ class TinkoffClient:
         с executed_lots == 0, полученному от брокера.
         Таймаут — API_REQUEST_TIMEOUT_SECONDS (защита от зависания цикла).
         """
+        member, supported = _order_id_type_member(order_id_type)
+        if not supported:
+            logging.error(
+                f"Ошибка статуса заявки {order_id}: SDK не позволяет запрос "
+                f"по order_id_type={order_id_type!r} — состояние НЕИЗВЕСТНО "
+                f"(fail-closed, без имитации поиска)"
+            )
+            return None
         try:
+            kwargs = dict(account_id=self.account_id, order_id=str(order_id))
+            if member is not None:
+                kwargs["order_id_type"] = member
             return await asyncio.wait_for(
-                self.client.sandbox.get_sandbox_order_state(
-                    account_id=self.account_id, order_id=order_id,
-                ),
+                self.client.sandbox.get_sandbox_order_state(**kwargs),
                 timeout=config.API_REQUEST_TIMEOUT_SECONDS,
             )
         except Exception as e:
             logging.error(f"Ошибка статуса заявки {order_id}: {type(e).__name__}: {e}")
             return None
 
-    async def cancel_order(self, order_id: str):
+    async def cancel_order(self, order_id: str, order_id_type=None):
         """
         Отменяет заявку.
+
+        ЭТАП 5Б: order_id_type — ЯВНЫЙ тип идентификатора (см.
+        get_sandbox_order_state): None — прежнее поведение; "EXCHANGE" —
+        биржевой ID; "REQUEST" — клиентский UUID. Отмена заявки под
+        подменённым идентификатором ЗАПРЕЩЕНА: если тип запрошен, но SDK
+        его не поддерживает, возвращается None (безопасная
+        неопределённость, fail-closed), вызывающий код не должен считать
+        заявку отменённой.
+
         Возвращает CancelOrderResponse или None.
         ВАЖНО: успешный ответ НЕ означает окончательную отмену.
-        Вызывающий код должен запросить get_sandbox_order_state(order_id)
-        и проверить финальный статус, lots_executed, lots_left.
+        Вызывающий код должен запросить get_sandbox_order_state
+        (с ТЕМ ЖЕ типом идентификатора) и проверить финальный статус,
+        lots_executed, lots_left.
         """
-        try:
-            return await self.client.sandbox.cancel_sandbox_order(
-                account_id=self.account_id, order_id=order_id,
+        member, supported = _order_id_type_member(order_id_type)
+        if not supported:
+            logging.error(
+                f"Ошибка отмены заявки {order_id}: SDK не позволяет отмену по "
+                f"order_id_type={order_id_type!r} — отмена НЕ выполнена "
+                f"(fail-closed, без подмены идентификатора)"
             )
+            return None
+        try:
+            kwargs = dict(account_id=self.account_id, order_id=str(order_id))
+            if member is not None:
+                kwargs["order_id_type"] = member
+            return await self.client.sandbox.cancel_sandbox_order(**kwargs)
         except Exception as e:
             logging.error(f"Ошибка отмены заявки {order_id}: {type(e).__name__}: {e}")
             return None

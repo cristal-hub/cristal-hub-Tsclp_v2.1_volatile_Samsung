@@ -2,6 +2,81 @@
 # Tsclp_v2.2_volatile — мониторинг позиций.
 # Полная замена: совместимость с API Samsung + per-order учёт SELL.
 #
+# ИЗМЕНЕНИЯ (v2.3.3-stage1 — дефект «повторное открытие позиции при
+# активной частичной SELL»):
+#   Сценарий дефекта: SELL 10 лот. -> PARTIALLYFILL (исполнено 3) ->
+#   apply_close_execution уменьшил локальное количество до 7 и перевёл
+#   позицию в UNCERTAIN -> process_closing получил достоверный снимок
+#   брокера с остатком 7 лотов -> resolve_uncertain() видел совпадение
+#   broker.lots == pos.quantity и переводил позицию в OPEN, хотя
+#   собственная SELL-заявка ещё не завершена (close_order_id активен).
+#   SL/TP снова включались и могли отправить ПОВТОРНУЮ SELL по позиции
+#   с незавершённой заявкой — перепродажа.
+#   Главный принцип исправления: совпадение локального остатка с
+#   брокерским количеством НЕ является основанием переводить позицию
+#   в OPEN, пока терминальность собственной SELL-заявки не подтверждена.
+#   Инвариант: close_order_id сбрасывается ТОЛЬКО при обработке
+#   терминального отчёта (apply_close_execution / resolve_closing),
+#   поэтому его наличие == «терминальность не подтверждена».
+#     - resolve_uncertain(): совпадение количества при активном
+#       close_order_id больше НЕ переводит позицию в OPEN — позиция
+#       остаётся UNCERTAIN (SL/TP не действуют, повторная SELL
+#       невозможна, новые BUY по FIGI заблокированы).
+#     - apply_close_execution(): терминальный статус (FILL/CANCELLED/
+#       REJECTED/EXPIRED) с ОСТАТКОМ (quantity > 0) больше НЕ переводит
+#       позицию в OPEN немедленно: подтверждённые лоты учтены per-order
+#       cursor'ом, завершённая заявка очищается, но остаток разрешается
+#       в OPEN только после подтверждения брокерским снимком
+#       (resolve_uncertain). Полное исполнение (quantity == 0) по-прежнему
+#       закрывает учёт немедленно (CLOSED).
+#     - apply_close_execution(): защита от противоречивых повторных
+#       отчётов — рост cumulative после учтённого терминального статуса
+#       отклоняется (fail-closed: UNCERTAIN, количество не меняется);
+#       идемпотентный повтор терминального отчёта игнорируется целиком
+#       (ни количества, ни состояния, ни дубля CSV).
+#     - resolve_closing(): отказ/отмена БЕЗ исполнения (REJECTED/CANCELLED
+#       при lots_executed == 0) больше НЕ возвращает позицию в OPEN
+#       немедленно — очистка завершённой заявки + UNCERTAIN; возврат
+#       в OPEN — только через подтверждение брокерским снимком.
+#       Ветви состояний не выполняются при противоречивом отчёте
+#       (apply_close_execution вернул False) — ссылка на заявку
+#       сохраняется для повторного опроса.
+#   Штатные сценарии сохранены: FILL закрывает учёт по фактическим
+#   исполнениям и per-order cursor; CANCELLED с частичным исполнением
+#   разрешает остаток как OPEN после сверки с брокером; REJECTED без
+#   исполнения возвращает позицию в OPEN при подтверждённом совпадении
+#   количества; неизвестный статус/ошибка запроса/None — fail-closed.
+#   Торговая логика (SL/TP, входы, риск-модель) не менялась;
+#   OrderLedger, P0-5, per-order cursor и fail-closed не ослаблены.
+#
+# ИЗМЕНЕНИЯ (v2.3.2-stage1 — аудит v2.3.1, Дефект 2 «обход двойного
+# подтверждения через UNCERTAIN»):
+#   - resolve_uncertain(): ветка «позиция отсутствует у брокера» БОЛЬШЕ НЕ
+#     закрывает учёт по одному достоверному снимку (прежнее поведение
+#     v2.3.1: мгновенный CLOSED с EXTERNAL_CLOSE — обход механизма В3).
+#     Позиция ОСТАЁТСЯ в UNCERTAIN; внешнее закрытие возможно только через
+#     единый механизм В3 (main.py::_try_resolve_absent_position — два
+#     достоверных снимка с интервалом >= RECONCILE_CONFIRM_MIN_AGE_SECONDS),
+#     закрытие собственной SELL-заявкой — только по её терминальному
+#     отчёту (resolve_closing/apply_close_execution, В2). Повторная
+#     отправка SELL невозможна (SL/TP действуют только на OPEN), новые BUY
+#     по FIGI заблокированы. P0-5, OrderLedger, per-order cursor и
+#     fail-closed не ослаблены.
+#
+# ИЗМЕНЕНИЯ (v2.3.1-stage1 — аудит ТЗ v2.3, пункты 4/5):
+#   - TrackedPosition.exit_price_confirmed: True ТОЛЬКО когда цена выхода
+#     взята из реального исполненного close-ордера этой позиции
+#     (apply_close_execution при avg_exec_price>0). Служит запретом
+#     фиктивного P&L в process_closing: если цена исполнения неизвестна
+#     (позиция исчезла у брокера в UNCERTAIN, отчёт ордера без цены),
+#     CSV-строка пишется БЕЗ P&L (поля пустые, error_note=PRICE_UNKNOWN),
+#     cumulative не искажается. Поле сериализуется в state.json; старый
+#     state.json восстанавливается с False (from_dict setdefault).
+#   - resolve_uncertain(): ветка «позиция отсутствует у брокера» ставила
+#     close_reason=EXTERNAL_CLOSE и закрывала учёт по одному снимку —
+#     поведение отменено в v2.3.2-stage1 (см. шапку выше).
+#   Торговая логика (SL/TP, закрытия, промоция) не менялась.
+#
 # ИЗМЕНЕНИЯ (исправление потери первичной регистрации BUY — guard
 # register_executed_buy):
 #   - ExecutionMonitor хранит компактный реестр closed_entry_order_ids —
@@ -49,6 +124,25 @@
 #   текущие вызовы (main.py: register_executed_buy OPEN/RECOVERY-ветки,
 #   promote_recovery_positions) передают непустой order_id, проверенный
 #   вызывающим кодом; поведение остальных методов не менялось.
+#
+# ИЗМЕНЕНИЯ (v2.3.0-stage1 — телеметрия MAE/MFE и безубыток/трейлинг, С1):
+#   TrackedPosition дополнен полями (в КОНЕЦ dataclass — порядок прежних
+#   полей не менялся; обратная совместимость со старым state.json через
+#   from_dict/setdefault):
+#   - initial_sl_price / initial_tp_price — SL/TP на момент входа (плановый
+#     риск R); инициализация ровно в двух точках: register() и
+#     promote_recovery();
+#   - mae_price / mfe_price — худшая/лучшая цена с момента входа: ТОЛЬКО
+#     по high/low 5-минутных свечей (update_extremes), НЕ по точечным
+#     ценам опроса — поллинг 30 с пропускает внутрибарные экстремумы;
+#   - breakeven_moved — флаг перевода в безубыток.
+#   Механика ВЫКЛЮЧЕНА по умолчанию (config.BE_TRAIL_ENABLED=False):
+#   _update_sl() — триггер безубытка по r_peak от ДОСТИГНУТОГО максимума
+#   (mfe_price, не текущей цены): SL -> entry ± буфер (2*комиссия +
+#   проскальзывание); затем трейлинг SL = mfe ∓ TRAIL_ATR_MULTIPLIER*ATR,
+#   только в сторону ужесточения и не хуже уровня безубытка. check_all()
+#   принимает extremes/atrs (необязательные — старый вызов с одной ценой
+#   работает как прежде) и классифицирует причину SL-выхода: SL / BE / TRAIL.
 import logging
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -69,6 +163,11 @@ ACTIVE_STATES = (
     PositionState.OPEN, PositionState.CLOSING,
     PositionState.UNCERTAIN, PositionState.RECOVERY,
 )
+
+# v2.3.3-stage1: терминальные статусы SELL-заявки закрытия. Единый набор
+# с веткой terminal в apply_close_execution; числовые коды — для
+# устойчивости к сырому значению execution_report_status.
+_TERMINAL_SELL_STATUSES = {"FILL", "CANCELLED", "REJECTED", "EXPIRED", "1", "2", "3"}
 
 
 @dataclass
@@ -108,6 +207,29 @@ class TrackedPosition:
     close_orders: Dict[str, dict] = field(default_factory=dict)
     # История применений сохраняется в state.json; записи не перезаписываются.
     close_applications: List[dict] = field(default_factory=list)
+    # --- v2.3.0-stage1: телеметрия и безубыток/трейлинг (С1) ---
+    # Поля добавлены В КОНЕЦ dataclass: порядок прежних полей не изменился.
+    # Для старых state.json значения восстанавливаются в from_dict().
+    # SL/TP на момент входа (плановый риск R = entry - initial_sl для BUY).
+    initial_sl_price: float = 0.0
+    initial_tp_price: float = 0.0
+    # Экстремумы с момента входа: худшая цена (BUY: min low; SELL: max high)
+    # и лучшая цена (BUY: max high; SELL: min low). 0.0 = «не инициализирован».
+    mae_price: float = 0.0
+    mfe_price: float = 0.0
+    # Флаг перевода в безубыток (триггер — r_peak по достигнутому mfe).
+    breakeven_moved: bool = False
+    # v2.3.1-stage1 (ТЗ-5): True ТОЛЬКО когда цена выхода взята из реального
+    # исполненного close-ордера этой позиции. Иначе CSV пишется без P&L
+    # (запрет фиктивного P&L при неизвестной цене исполнения).
+    exit_price_confirmed: bool = False
+    # ЭТАП 5Б: КЛИЕНТСКИЙ UUID (ключ идемпотентности) активной SELL-заявки
+    # закрытия. Известен ДО отправки (генерируется до сетевого вызова) и
+    # сохраняется в позиции ДАЖЕ при потере ответа брокера — по нему заявка
+    # находится в реестре и опрашивается по ORDER_ID_TYPE_REQUEST.
+    # НЕ подменяет биржевой ID: биржевой ID хранится в close_order_id и
+    # заполняется ТОЛЬКО настоящим ID из ответа брокера.
+    close_order_request_id: Optional[str] = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -126,6 +248,32 @@ class TrackedPosition:
         # close_order_id, который реально сохранён в state.
         d.setdefault("close_orders", {})
         d.setdefault("close_applications", [])
+        # v2.3.0-stage1: старые state.json не содержат телеметрии С1.
+        # initial_* восстанавливаются из текущих sl/tp (лучшее доступное
+        # приближение для уже открытых позиций), экстремумы стартуют с нуля
+        # (начнут накапливаться по свечам), breakeven_moved — False.
+        d.setdefault("initial_sl_price", d.get("sl_price") or 0.0)
+        d.setdefault("initial_tp_price", d.get("tp_price") or 0.0)
+        d.setdefault("mae_price", 0.0)
+        d.setdefault("mfe_price", 0.0)
+        d.setdefault("breakeven_moved", False)
+        # v2.3.1-stage1 (ТЗ-5): старый state.json не содержит маркер
+        # подтверждённой цены выхода — консервативно False (P&L такой
+        # позиции при закрытии не рассчитывается, ошибку не делаем).
+        d.setdefault("exit_price_confirmed", False)
+        d.setdefault("close_order_request_id", None)
+        # ЭТАП 5Б — ОБЯЗАТЕЛЬНАЯ МИГРАЦИЯ state.json (идемпотентная):
+        # в старых версиях pos.close_order_id фактически содержал
+        # КЛИЕНТСКИЙ UUID (ключ идемпотентности), а не биржевой ID.
+        # Старый close_order_id при отсутствии нового close_order_request_id
+        # переносится в close_order_request_id; close_order_id очищается
+        # и заполняется ТОЛЬКО настоящим биржевым ID из ответа брокера.
+        # Идемпотентность: повторная загрузка/сохранение не меняет смысл
+        # идентификаторов (миграция выполняется только пока request_id пуст).
+        legacy_close_oid = d.get("close_order_id")
+        if legacy_close_oid and not d.get("close_order_request_id"):
+            d["close_order_request_id"] = str(legacy_close_oid)
+            d["close_order_id"] = None
         return cls(**d)
 
 
@@ -160,6 +308,12 @@ class ExecutionMonitor:
             return existing
         self._archive_closed_entry_order(self.positions.get(figi))
         pos = TrackedPosition(**kwargs)
+        # v2.3.0-stage1 (С1): точка инициализации №1 — SL/TP фиксируются на
+        # момент входа (плановый риск для триггера безубытка).
+        if pos.initial_sl_price <= 0 and pos.sl_price > 0:
+            pos.initial_sl_price = pos.sl_price
+        if pos.initial_tp_price <= 0 and pos.tp_price > 0:
+            pos.initial_tp_price = pos.tp_price
         if not self._valid_position(pos):
             raise ValueError("Некорректные параметры позиции")
         self.positions[pos.figi] = pos
@@ -217,6 +371,15 @@ class ExecutionMonitor:
         pos.entry_price, pos.sl_price, pos.tp_price = ep, sl, tp
         pos.execution_price = float(execution_price) if execution_price and execution_price > 0 else ep
         pos.recovery_source = None
+        # v2.3.0-stage1 (С1): точка инициализации №2 — SL/TP фиксируются на
+        # момент промоции (цена входа восстановлена), экстремумы стартуют
+        # от цены входа (до промоции они не отслеживались — позиция была
+        # RECOVERY), флаг безубытка сброшен.
+        pos.initial_sl_price = sl
+        pos.initial_tp_price = tp
+        pos.mae_price = ep
+        pos.mfe_price = ep
+        pos.breakeven_moved = False
         pos.state = PositionState.OPEN
         return True
 
@@ -319,7 +482,12 @@ class ExecutionMonitor:
         return True
 
     def add_close_order(self, pos, order_id, requested_lots, requested_at=None):
-        """Регистрирует отдельную SELL-заявку до/после отправки; повторный ID идемпотентен."""
+        """Регистрирует отдельную SELL-заявку до/после отправки; повторный ID идемпотентен.
+
+        ЭТАП 5Б: вызывается close_position (через monitor_ref) ДО отправки —
+        намерение SELL в журнале позиции появляется раньше сетевого вызова.
+        Ключ записи — клиентский UUID заявки (совпадает с ключом реестра).
+        Повторный вызов с тем же ID и тем же количеством — без изменений."""
         if not order_id or int(requested_lots) <= 0:
             raise ValueError("Нужны order_id и положительное requested_lots")
         oid = str(order_id)
@@ -372,6 +540,35 @@ class ExecutionMonitor:
             pos.state = PositionState.UNCERTAIN
             logging.error(f"[execution] {pos.ticker}: SELL delta {delta} exceeds remaining {pos.quantity}")
             return False
+        # v2.3.3-stage1: терминальный статус этой заявки УЖЕ учтён — отчёт
+        # «заморожен». Терминальный статус означает, что исполнение заявки
+        # больше не изменится, поэтому:
+        #   - рост cumulative после учтённого терминала — противоречивый
+        #     поздний/дублирующий отчёт: fail-closed, применение ЗАПРЕЩЕНО
+        #     (количество позиции не меняется, повторного применения нет,
+        #     дубль CSV-строки исключён);
+        #   - повтор ТОГО ЖЕ терминального отчёта игнорируется целиком —
+        #     идемпотентность без побочных эффектов на состояние позиции
+        #     (раньше повтор CANCELLED переводил разрешённую позицию
+        #     обратно в OPEN, а повтор PARTIALLYFILL — сбрасывал в
+        #     UNCERTAIN, оба без доказательств).
+        prev_status = str(rec.get("status") or "").upper()
+        if prev_status in _TERMINAL_SELL_STATUSES:
+            if cumulative > previous:
+                pos.state = PositionState.UNCERTAIN
+                logging.error(
+                    f"[execution] {pos.ticker}: cumulative {cumulative} > "
+                    f"учтённого терминального {previous} ({prev_status}) — "
+                    f"противоречивый отчёт по завершённой заявке {oid}, "
+                    f"применение запрещено (fail-closed)"
+                )
+                return False
+            logging.info(
+                f"[execution] {pos.ticker}: повторный терминальный отчёт "
+                f"{oid} ({prev_status}, cumulative={cumulative}) — "
+                f"игнорируется (уже учтён per-order cursor'ом)"
+            )
+            return False
         # Записываем подтверждение и применение как отдельные поля одной записи.
         rec["confirmed_executed_lots"] = cumulative
         rec["status"] = str(status)
@@ -390,21 +587,38 @@ class ExecutionMonitor:
         else:
             rec["applied_lots"] = applied
         # Совместимые legacy-поля отражают только текущий/последний ордер.
-        if pos.close_order_id == oid:
+        # ЭТАП 5Б: совпадение проверяется с ОБЕИМИ ссылками позиции — ключ
+        # журнала (oid) всегда клиентский UUID, а close_order_id после
+        # разделения хранит БИРЖЕВОЙ ID (совпадёт только для legacy).
+        if oid in (pos.close_order_id, getattr(pos, "close_order_request_id", None)):
             pos.close_requested_lots = requested
             pos.close_applied_lots = int(rec["applied_lots"])
         pos.executed_lots = cumulative
         pos.execution_price = rec["avg_exec_price"]
+        # v2.3.1-stage1 (ТЗ-5): цена выхода подтверждена ТОЛЬКО если она
+        # получена из отчёта исполненного close-ордера (avg_exec_price>0).
+        pos.exit_price_confirmed = rec["avg_exec_price"] is not None
         pos.actual_commission = rec["commission"]
-        terminal = str(status).upper() in {"FILL", "CANCELLED", "REJECTED", "EXPIRED", "1", "2", "3"}
+        terminal = str(status).upper() in _TERMINAL_SELL_STATUSES
         full = cumulative == requested
         if pos.quantity == 0:
             pos.state = PositionState.CLOSED
         elif terminal:
-            # Частичный терминальный SELL закончен; остаток позиции остаётся OPEN.
-            pos.state = PositionState.OPEN
-            if pos.close_order_id == oid:
+            # v2.3.3-stage1: терминальный отчёт учтён per-order cursor'ом,
+            # завершённая заявка очищается, НО остаток позиции
+            # (quantity > 0) разрешается в OPEN ТОЛЬКО после подтверждения
+            # брокерским снимком (resolve_uncertain в process_closing).
+            # Прежний немедленный OPEN позволял SL/TP отправить новую SELL
+            # до сверки локального остатка с брокерским — риск перепродажи
+            # при расхождении. UNCERTAIN безопасен: SL/TP не действуют,
+            # новые BUY по FIGI заблокированы, повторная SELL не
+            # отправляется. Полное исполнение (quantity == 0) закрыто выше.
+            pos.state = PositionState.UNCERTAIN
+            if oid in (pos.close_order_id, getattr(pos, "close_order_request_id", None)):
+                # ЭТАП 5Б: очищаются ОБЕ ссылки заявки — и биржевой ID, и
+                # клиентский UUID (журнал close_orders сохраняется целиком).
                 pos.close_order_id = None
+                pos.close_order_request_id = None
                 pos.close_requested_lots = 0
                 pos.close_applied_lots = 0
         elif str(status).upper() in {"PARTIALLYFILL", "5"}:
@@ -420,7 +634,122 @@ class ExecutionMonitor:
         p = self.positions.get(figi)
         return p is not None and p.state in ACTIVE_STATES
 
-    async def check_all(self, prices: Dict[str, float]) -> List[TrackedPosition]:
+    # --- v2.3.0-stage1 (С1): безубыток/трейлинг (ВЫКЛЮЧЕНО по умолчанию) ---
+
+    @staticmethod
+    def _be_buffer(entry_price: float) -> float:
+        """Буфер безубытка: компенсация двойной комиссии + проскальзывания."""
+        return entry_price * (2 * config.COMMISSION_PER_SIDE + config.SLIPPAGE_PERCENT)
+
+    @staticmethod
+    def _risk_per_share(pos) -> float:
+        """Плановый риск на акцию: entry - initial_sl (BUY); initial_sl - entry (SELL)."""
+        if pos.direction == "BUY":
+            return pos.entry_price - pos.initial_sl_price
+        return pos.initial_sl_price - pos.entry_price
+
+    def update_extremes(self, pos, high, low) -> bool:
+        """Обновляет MAE/MFE по high/low 5-минутной свечи (НЕ по точечным
+        ценам опроса: поллинг 30 с пропускает внутрибарные экстремумы).
+        BUY:  mfe = max(high), mae = min(low). SELL: зеркально.
+        Только для OPEN-позиций; значение 0.0 трактуется как «не инициализирован»."""
+        if pos.state != PositionState.OPEN:
+            return False
+        try:
+            high = float(high) if high is not None else None
+            low = float(low) if low is not None else None
+        except (TypeError, ValueError):
+            return False
+        changed = False
+        if pos.direction == "BUY":
+            if high and high > 0 and (pos.mfe_price <= 0 or high > pos.mfe_price):
+                pos.mfe_price = high
+                changed = True
+            if low and low > 0 and (pos.mae_price <= 0 or low < pos.mae_price):
+                pos.mae_price = low
+                changed = True
+        else:
+            if low and low > 0 and (pos.mfe_price <= 0 or low < pos.mfe_price):
+                pos.mfe_price = low
+                changed = True
+            if high and high > 0 and (pos.mae_price <= 0 or high > pos.mae_price):
+                pos.mae_price = high
+                changed = True
+        return changed
+
+    def _update_sl(self, pos, atr) -> None:
+        """Триггер безубытка и трейлинг (С1).
+
+        Триггер — по ДОСТИГНУТОМУ максимуму (r_peak от mfe_price, не от
+        текущей цены): при r_peak >= BE_TRIGGER_R SL переносится на
+        entry ± буфер (2*комиссия + проскальзывание). После перевода —
+        трейлинг: SL = mfe ∓ TRAIL_ATR_MULTIPLIER*ATR, только в сторону
+        ужесточения и не хуже уровня безубытка. SL никогда не ослабляется.
+        Работает только при config.BE_TRAIL_ENABLED=True (по умолчанию
+        выключено — поведение системы идентично прежнему)."""
+        if not getattr(config, "BE_TRAIL_ENABLED", False):
+            return
+        if pos.state != PositionState.OPEN:
+            return
+        risk = self._risk_per_share(pos)
+        if risk <= 0:
+            return
+        buffer = self._be_buffer(pos.entry_price)
+        if pos.direction == "BUY":
+            # --- триггер безубытка ---
+            if not pos.breakeven_moved and pos.mfe_price > 0:
+                r_peak = (pos.mfe_price - pos.entry_price) / risk
+                if r_peak >= config.BE_TRIGGER_R:
+                    new_sl = pos.entry_price + buffer
+                    if new_sl > pos.sl_price:
+                        logging.info(
+                            f"[execution] {pos.ticker}: BE trigger r_peak={r_peak:.2f} "
+                            f"(mfe={pos.mfe_price:.4f}) — SL {pos.sl_price:.4f} -> {new_sl:.4f}"
+                        )
+                        pos.sl_price = new_sl
+                    pos.breakeven_moved = True
+            # --- трейлинг от достигнутого максимума ---
+            if pos.breakeven_moved and atr and atr > 0 and pos.mfe_price > 0:
+                candidate = pos.mfe_price - config.TRAIL_ATR_MULTIPLIER * float(atr)
+                if candidate > pos.sl_price and candidate > pos.entry_price + buffer:
+                    logging.info(
+                        f"[execution] {pos.ticker}: TRAIL — SL {pos.sl_price:.4f} -> {candidate:.4f} "
+                        f"(mfe={pos.mfe_price:.4f}, atr={float(atr):.4f})"
+                    )
+                    pos.sl_price = candidate
+        else:
+            # --- зеркало для SHORT (в текущей стратегии не используются,
+            # но учёт поддерживает адопцию SHORT-позиций) ---
+            if not pos.breakeven_moved and pos.mfe_price > 0:
+                r_peak = (pos.entry_price - pos.mfe_price) / risk
+                if r_peak >= config.BE_TRIGGER_R:
+                    new_sl = pos.entry_price - buffer
+                    if new_sl < pos.sl_price:
+                        pos.sl_price = new_sl
+                    pos.breakeven_moved = True
+            if pos.breakeven_moved and atr and atr > 0 and pos.mfe_price > 0:
+                candidate = pos.mfe_price + config.TRAIL_ATR_MULTIPLIER * float(atr)
+                if candidate < pos.sl_price and candidate < pos.entry_price - buffer:
+                    pos.sl_price = candidate
+
+    def _classify_sl_exit(self, pos) -> str:
+        """Причина SL-выхода для журнала: SL (штатный стоп) / BE (безубыток)
+        / TRAIL (трейлинг выше уровня безубытка)."""
+        if not pos.breakeven_moved:
+            return "SL"
+        buffer = self._be_buffer(pos.entry_price)
+        if pos.direction == "BUY":
+            return "TRAIL" if pos.sl_price > pos.entry_price + buffer else "BE"
+        return "TRAIL" if pos.sl_price < pos.entry_price - buffer else "BE"
+
+    async def check_all(self, prices: Dict[str, float], extremes=None, atrs=None) -> List[TrackedPosition]:
+        """Проверка SL/TP по всем OPEN-позициям.
+
+        v2.3.0-stage1: extremes — {figi: (high, low)} последней 5-мин свечи,
+        atrs — {figi: ATR}. Порядок обработки позиции: экстремумы ->
+        триггер BE/трейлинг (только при BE_TRAIL_ENABLED=True) -> проверка
+        SL/TP. При срабатывании стопа причина классифицируется (SL/BE/TRAIL).
+        Вызов с одним аргументом (только цены) работает как прежде."""
         to_close = []
         self.monitoring_error = False
         if prices is None or not prices:
@@ -433,10 +762,25 @@ class ExecutionMonitor:
             if price is None or price <= 0:
                 self.monitoring_error = True
                 continue
+            # С1: свечные экстремумы -> триггер BE/трейлинг -> SL/TP
+            if extremes:
+                candle = extremes.get(pos.figi)
+                if candle:
+                    self.update_extremes(pos, candle[0], candle[1])
+            if getattr(config, "BE_TRAIL_ENABLED", False):
+                self._update_sl(pos, (atrs or {}).get(pos.figi))
             if pos.direction == "BUY":
-                reason = "SL" if price <= pos.sl_price else "TP" if price >= pos.tp_price else None
+                hit_tp = price >= pos.tp_price
+                hit_sl = price <= pos.sl_price
             else:
-                reason = "SL" if price >= pos.sl_price else "TP" if price <= pos.tp_price else None
+                hit_tp = price <= pos.tp_price
+                hit_sl = price >= pos.sl_price
+            if hit_tp:
+                reason = "TP"
+            elif hit_sl:
+                reason = self._classify_sl_exit(pos)
+            else:
+                reason = None
             if reason:
                 pos.state = PositionState.CLOSING
                 pos.close_reason = reason
@@ -444,14 +788,49 @@ class ExecutionMonitor:
                 to_close.append(pos)
         return to_close
 
-    async def resolve_closing(self, pos):
-        """Проверяет активный close_order_id. История предыдущих SELL сохраняется."""
-        oid = pos.close_order_id
+    async def resolve_closing(self, pos, ledger=None):
+        """Проверяет активную SELL-заявку закрытия. История предыдущих SELL сохраняется.
+
+        ЭТАП 5Б: опрос с ЯВНЫМ типом идентификатора:
+          - известен БИРЖЕВОЙ ID (close_order_id из ответа брокера) —
+            запрос по ORDER_ID_TYPE_EXCHANGE;
+          - известен ТОЛЬКО клиентский UUID (потерянный ответ брокера,
+            миграция старого state.json) — запрос по ORDER_ID_TYPE_REQUEST
+            (клиентский UUID НЕ передаётся как биржевой ID).
+        Ключ журнала close_orders — клиентский UUID (совпадает с ключом
+        реестра заявок). Если брокер не отвечает по обоим типам —
+        состояние неизвестно: позиция остаётся UNCERTAIN (fail-closed),
+        никакой имитации успешного поиска.
+
+        ledger (опционально): реестр заявок для СИНХРОНИЗАЦИИ статуса
+        SELL-записи с фактическим отчётом брокера. Без синхронизации
+        запись реестра остаётся в устаревшем статусе (например
+        PARTIALLYFILL) после обработки терминального отчёта заявки — и
+        FIGI-level блокировка (resolve_uncertain / close_position) не
+        снимется даже после достоверного терминального результата.
+        Синхронизация идемпотентна: повторный отчёт с тем же
+        cumulative исполнением не меняет учёт (per-order cursor).
+        Логика частичного исполнения apply_close_execution НЕ меняется."""
+        req_id = getattr(pos, "close_order_request_id", None)
+        exch_id = pos.close_order_id
+        # Ключ журнала/реестра — клиентский UUID; для legacy-позиций
+        # (до миграции/в памяти) request_id может быть пуст — тогда ключ
+        # прежний (close_order_id исторически содержал клиентский UUID).
+        oid = str(req_id or exch_id or "")
         if not oid:
             pos.state = PositionState.UNCERTAIN
             return
         try:
-            state = await self.client.get_sandbox_order_state(oid)
+            if exch_id:
+                # Биржевой ID известен — запрос строго по EXCHANGE.
+                state = await self.client.get_sandbox_order_state(
+                    str(exch_id), order_id_type="EXCHANGE",
+                )
+            else:
+                # Только клиентский UUID — запрос строго по REQUEST.
+                state = await self.client.get_sandbox_order_state(
+                    str(req_id), order_id_type="REQUEST",
+                )
             if state is None:
                 pos.state = PositionState.UNCERTAIN
                 return
@@ -481,12 +860,54 @@ class ExecutionMonitor:
                         f"{legacy_applied} без per-order истории; требуется reconcile"
                     )
                     return
-            self.apply_close_execution(pos, oid, lots, status, price, commission, requested)
+            applied_ok = self.apply_close_execution(
+                pos, oid, lots, status, price, commission, requested
+            )
+            # ЭТАП 5Б (§4.3): синхронизация записи реестра с фактическим
+            # отчётом брокера (статус + cumulative исполнение этой заявки).
+            # Без неё незавершённая SELL-запись реестра блокирует разрешение
+            # позиции ПОСЛЕ терминального отчёта (FIGI-level блокировка не
+            # снимается). Повтор терминального отчёта — идемпотентен
+            # (ledger сам защищает исполнение от регрессии/переполнения).
+            if ledger is not None and applied_ok:
+                try:
+                    # reason записи СОХРАНЯЕТСЯ: он несёт атрибуцию закрытия
+                    # ("close:SL" и т.п.), используемую пакетом В2 для
+                    # close_reason CSV-строки. Меняются только статус/лоты/цена.
+                    prev_rec = ledger.latest(oid)
+                    prev_reason = str((prev_rec or {}).get("reason") or "")
+                    ledger.record_status(
+                        oid, str(status) if status else "UNKNOWN",
+                        figi=pos.figi, ticker=pos.ticker,
+                        side="SELL" if pos.direction == "BUY" else "BUY",
+                        requested_lots=int(requested),
+                        executed_lots=int(lots),
+                        avg_exec_price=price,
+                        reason=prev_reason or "статус заявки закрытия подтверждён брокером",
+                        source="resolve_closing",
+                    )
+                except Exception as ledger_exc:
+                    logging.error(
+                        f"[execution] {pos.ticker}: синхронизация реестра для "
+                        f"SELL {oid} не удалась: {type(ledger_exc).__name__}: {ledger_exc}"
+                    )
             if status_int == 5 and pos.state != PositionState.CLOSED:
                 pos.state = PositionState.UNCERTAIN
-            elif status_int in (2, 3) and lots == 0 and pos.state != PositionState.CLOSED:
-                pos.state = PositionState.OPEN
+            elif (applied_ok and status_int in (2, 3) and lots == 0
+                  and pos.state != PositionState.CLOSED):
+                # v2.3.3-stage1: отказ/отмена БЕЗ исполнения. Заявка
+                # терминальна и очищается, но возврат в OPEN — только после
+                # подтверждения брокерским снимком (resolve_uncertain):
+                # при отсутствии/расхождении позиции у брокера немедленный
+                # OPEN позволял SL/TP отправить обречённую SELL. Ветвь не
+                # выполняется при противоречивом отчёте (applied_ok=False,
+                # в т.ч. замороженный терминальный повтор) — ссылка на
+                # заявку сохраняется для повторного опроса.
+                pos.state = PositionState.UNCERTAIN
+                # ЭТАП 5Б: очищаются ОБЕ ссылки (биржевой ID и клиентский
+                # UUID) — разрешение остатка только по брокерскому снимку.
                 pos.close_order_id = None
+                pos.close_order_request_id = None
                 pos.close_requested_lots = 0
                 pos.close_applied_lots = 0
             elif status_int == 1 and lots < requested and pos.state != PositionState.CLOSED:
@@ -495,17 +916,96 @@ class ExecutionMonitor:
             logging.error(f"[execution] resolve_closing {pos.ticker}: {type(exc).__name__}: {exc}")
             pos.state = PositionState.UNCERTAIN
 
-    def resolve_uncertain(self, pos, broker_positions):
+    def resolve_uncertain(self, pos, broker_positions, ledger=None):
         broker = broker_positions.get(pos.figi)
         if broker is None:
-            pos.quantity = 0
-            pos.state = PositionState.CLOSED
+            # v2.3.2-stage1 (Дефект-2: обход двойного подтверждения через
+            # UNCERTAIN). РАНЬШЕ позиция здесь немедленно закрывалась по
+            # ОДНОМУ достоверному снимку «позиция отсутствует» — это
+            # обходило механизм В3 (два достоверных снимка с минимальным
+            # интервалом) и закрывало учёт, пока исход собственной
+            # SELL-заявки не подтверждён (кейс: UNCERTAIN + позиция
+            # исчезла -> мгновенный CLOSED с неизвестной ценой).
+            # ТЕПЕРЬ: отсутствие позиции у брокера при UNCERTAIN учёт НЕ
+            # закрывает. Позиция ОСТАЁТСЯ в UNCERTAIN:
+            #   - исполнение собственной close-заявки разрешится штатно:
+            #     process_closing -> resolve_closing -> apply_close_execution
+            #     (per-order cursor, идемпотентно) с РЕАЛЬНОЙ ценой, либо
+            #     В2 в reconcile (достоверный ТЕРМИНАЛЬНЫЙ отчёт реестра);
+            #   - внешнее закрытие проходит ТОЛЬКО через единый механизм В3
+            #     (_try_resolve_absent_position в reconcile): первый
+            #     достоверный снимок -> кандидат, закрытие — только после
+            #     ВТОРОГО достоверного снимка с интервалом не меньше
+            #     RECONCILE_CONFIRM_MIN_AGE_SECONDS;
+            #   - get_positions()=None (недостоверный снимок) сюда не доходит:
+            #     process_closing при None не вызывает resolve_uncertain и не
+            #     трогает кандидатов В3 — снимок НИ подтверждает, НИ сбрасывает
+            #     подозрение;
+            #   - повторная отправка SELL не выполняется: SL/TP действуют
+            #     только на OPEN (check_all), close_position для UNCERTAIN
+            #     не вызывается;
+            #   - новые BUY по FIGI заблокированы (UNCERTAIN в реестре/
+            #     ACTIVE_STATES + client.uncertain_state), P0-5/OrderLedger/
+            #     fail-closed не затронуты.
+            pos.state = PositionState.UNCERTAIN
             return
         if getattr(broker, "direction", "UNKNOWN") == "UNKNOWN":
             pos.state = PositionState.UNCERTAIN
             return
         expected = "LONG" if pos.direction == "BUY" else "SHORT"
         if broker.direction != expected or abs(int(broker.lots)) != pos.quantity:
+            pos.state = PositionState.UNCERTAIN
+            return
+        # v2.3.3-stage1 (дефект «повторное открытие при активной частичной
+        # SELL»): совпадение количества — НЕ основание для OPEN, пока
+        # собственная SELL-заявка закрытия имеет неподтверждённую
+        # терминальность. close_order_id сбрасывается ТОЛЬКО обработкой
+        # терминального отчёта (apply_close_execution / resolve_closing),
+        # поэтому его наличие означает: заявка ещё жива (NEW/PARTIALLYFILL)
+        # или её исход не подтверждён. Кейс дефекта: SELL 10, исполнено 3
+        # (PARTIALLYFILL), локальный остаток 7 == broker.lots 7 — раньше
+        # позиция переводилась в OPEN, SL/TP снова включались и могли
+        # отправить повторную SELL по позиции с незавершённой заявкой
+        # (перепродажа). Теперь позиция остаётся UNCERTAIN: SL/TP не
+        # действуют, повторная SELL невозможна, новые BUY по FIGI
+        # заблокированы (has_active_position). Штатное разрешение
+        # сохранено: терминальный отчёт очищает close_order_id, следующий
+        # достоверный снимок с совпадающим остатком возвращает позицию
+        # в OPEN.
+        #
+        # ЭТАП 5Б (§4.3 постановки):
+        #   1) проверяются ОБЕ ссылки заявки: close_order_id (биржевой ID)
+        #      И close_order_request_id (клиентский UUID, сохранённый даже
+        #      при ПОТЕРЯННОМ ответе брокера — совпадение количества в
+        #      портфеле не доказывает, что потерянная SELL не принята);
+        #   2) OPEN запрещён, если в реестре существует незавершённая
+        #      SELL-запись по FIGI (INTENT/SENT/NEW/PARTIALLYFILL/UNCERTAIN
+        #      и заявление с неизвестной судьбой после краха между INTENT и
+        #      сохранением state.json). Совпадение количества в портфеле
+        #      НЕ является доказательством того, что предыдущая SELL не
+        #      принята брокером.
+        # Автоматическое снятие блокировки — ТОЛЬКО после достоверного
+        # ТЕРМИНАЛЬНОГО результата исходной заявки (apply_close_execution /
+        # resolve_closing) либо отдельного операторского разрешения;
+        # общая логика В2/В3 не меняется.
+        close_side = "SELL" if pos.direction == "BUY" else "BUY"
+        ledger_has_open_sell = (
+            ledger is not None
+            and ledger.figi_has_open_order(pos.figi, close_side)
+        )
+        if pos.close_order_id or getattr(pos, "close_order_request_id", None) or ledger_has_open_sell:
+            block_source = ("close_order_id=" + str(pos.close_order_id)
+                            if pos.close_order_id else
+                            ("close_order_request_id=" + str(getattr(pos, "close_order_request_id", None))
+                             if getattr(pos, "close_order_request_id", None) else
+                             "незавершённая SELL-запись реестра по FIGI"))
+            logging.warning(
+                f"[execution] {pos.ticker}: остаток {abs(int(broker.lots))} лот. "
+                f"совпадает с локальным, но исходная SELL-заявка закрытия не "
+                f"разрешена ({block_source}; ledger_has_open_sell="
+                f"{ledger_has_open_sell}) — терминальность не подтверждена, "
+                f"повторное открытие ЗАПРЕЩЕНО, позиция остаётся UNCERTAIN"
+            )
             pos.state = PositionState.UNCERTAIN
             return
         pos.quantity = abs(int(broker.lots))
